@@ -367,26 +367,23 @@ def fetch_fundamentals_one(ticker: str) -> dict:
     base["dcf_value"]     = dcf_val
     base["dcf_price_val"] = dcf_price
 
-    # Piotroski
-    fs = _first(get("financial-score", {"symbol": ticker}) or [])
+    # Piotroski (and other financial-health scores)
+    # NOTE: FMP renamed this endpoint from singular "financial-score" to
+    # plural "financial-scores" in the /stable/ API. The response payload
+    # keeps the same field names (piotroskiScore, altmanZScore, ...).
+    fs = _first(get("financial-scores", {"symbol": ticker}) or [])
     base["piotroski"] = _pick(fs, "piotroskiScore", "piotroski")
 
     # Insider trading (90d)
-    ins    = get("insider-trading", {"symbol": ticker, "limit": 50}) or []
-    cutoff = pd.Timestamp.today() - pd.Timedelta(days=90)
-    buys = sells = 0
-    for t in (ins if isinstance(ins, list) else []):
-        dt_str = t.get("transactionDate") or t.get("filingDate") or ""
-        dt = pd.to_datetime(dt_str, errors="coerce")
-        if pd.isna(dt) or dt < cutoff:
-            continue
-        tt = str(t.get("transactionType", "")).upper()
-        if "PURCHASE" in tt or tt in ("P", "P-"):
-            buys += 1
-        elif "SALE" in tt or tt in ("S", "S-"):
-            sells += 1
-    base["insider_buys"]   = buys
-    base["insider_sells"]  = sells
-    base["insider_signal"] = buys - sells
+    # NOTE: The "insider-trading" endpoint was removed from the FMP /stable/
+    # API and no drop-in replacement was found across the tested variants
+    # (insider-trades, insider-trading-latest, insider-trading-statistics,
+    # insider-trades-search — all return 404). We degrade gracefully by
+    # leaving the counts at zero and emitting a single debug log per call.
+    # If FMP exposes a new path, restore the lookup here.
+    logger.debug("[fmp] insider-trading lookup skipped — endpoint removed by FMP")
+    base["insider_buys"] = 0
+    base["insider_sells"] = 0
+    base["insider_signal"] = 0
 
     return base
