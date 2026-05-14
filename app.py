@@ -775,10 +775,12 @@ def _load_all_data_locked(transactions_path, years_back):
     factor_table = df_tech_last.copy()
 
     if prices_port is not None:
-        pp = prices_port.copy()
-        if "price" not in pp.columns:
-            pp = pp.rename(columns={"close": "price"})
-        pnl = build_portfolio_analytics(transactions_path, pp)
+        # Pass the raw price frame; build_positions() internally selects
+        # adj_close (preferred) or close and renames it to "price". A
+        # pre-rename here would create two columns named "price" and
+        # crash with "Cannot set a DataFrame with multiple columns to
+        # the single column price_eur".
+        pnl = build_portfolio_analytics(transactions_path, prices_port)
     else:
         pnl = pd.DataFrame()
 
