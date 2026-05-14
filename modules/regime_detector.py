@@ -90,19 +90,19 @@ REQUIRED_COLUMNS: set[str] = {"ticker", "date"}
 #: Each tuple holds (label, star-rating, hex color, recommendation text).
 _REGIME_DEFINITIONS: list[tuple[str, str, str, str]] = [
     (
-        "BULL FORTE",
+        "BULL STRONG",
         "★★★★★",
         "#2D6A4F",
         "Model is at peak performance. Trust the ranking.",
     ),
     (
-        "BULL CALMO",
+        "BULL CALM",
         "★★★★",
         "#95D5B2",
         "Model works well. Diversify across the top 20.",
     ),
     (
-        "INCERTO",
+        "UNCERTAIN",
         "★★",
         "#E67E22",
         "Uncertain regime. Model may underperform — reduce conviction.",
@@ -284,7 +284,7 @@ def compute_regime(prices: pd.DataFrame) -> Optional[dict]:
         is missing or insufficient. Keys:
 
         * ``date`` (str)            — Date of the latest observation
-        * ``regime`` (str)          — Label (e.g. ``"BULL FORTE"``)
+        * ``regime`` (str)          — Label (e.g. ``"BULL STRONG"``)
         * ``stars`` (str)           — 1-5 star quality rating
         * ``color`` (str)           — Hex color for the UI banner
         * ``recommendation`` (str)  — Suggested action for the regime

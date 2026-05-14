@@ -1,9 +1,32 @@
 """
-app.py  —  MondayFever Dashboard
-================================
-Run:  python app.py
-Then open:  http://127.0.0.1:8050
+app.py — QuantEdge Dashboard (Dash + Plotly).
+
+Main entry point for the QuantEdge quantitative analytics web app. Wires
+together the analytics, modules, and ingestion packages into a single
+Dash application served by Flask (and gunicorn in production).
+
+The app exposes three tabs:
+
+* **Portfolio**   — Real-time P&L, holdings, FX, sector allocation, and
+  stop-loss recommendations for the user's actual trades.
+* **Screener**    — Multi-factor ranking table combining technical,
+  fundamental, and ML scores, plus the current market-regime banner.
+* **Strategy Lab** — Interactive backtest of a DCA strategy with live
+  weight sliders and a weight optimiser.
+
+Run locally:
+
+    python app.py
+
+Run in production:
+
+    gunicorn --config gunicorn_config.py app:server
+
+Open the UI at http://127.0.0.1:8050 (or the platform-assigned URL).
 """
+
+import logging
+import os
 
 import numpy as np
 import pandas as pd
@@ -24,6 +47,21 @@ from fundamental import compute_fundamentals, _fmp_get
 from portfolio   import build_portfolio_analytics
 from portfolio   import load_transactions
 from portfolio   import get_fx_data
+
+
+# ── Logging configuration ────────────────────────────────────────────────────
+# Configured once at the application entry point. Library modules use
+# logging.getLogger(__name__) and inherit this configuration automatically.
+# In production (gunicorn on Railway/Render/Heroku) the logs stream to
+# stdout and are captured by the platform's log viewer.
+
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("quantedge.app")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1558,9 +1596,9 @@ def update_screener(n, metric, min_tech, sectors, topn):
             "Mkt Cap":           "Market cap = shares x price. T=trillion, B=billion.",
             "YTD %":             "Year-to-date return: (price_today / price_jan1) - 1.",
             "technical_score":   "Composite 0-1. Signals: momentum 12M (+30%), return 20d (+20%), trend vs EMA200 (+15%), MACD (+10%), minus volatility 60d (-20%) and drawdown 12M (-15%). Z-scored per date.",
-            "ML Score":          "LightGBM ranking model (0-1). Trained on 10 technical features. Predicts 3-month relative rank.",
-            "ML Band":           "80% confidence band [q10 — q90]. Wide band = high uncertainty on this stock.",
-            "ML Decile":         "Decile ranking 1-10. Decile 10 = top 10% predicted. Decile 1 = bottom 10%.",
+            "ML Score":          "LightGBM ranking model (0-1). Trained on 10 technical features. Predicts 3-month relative rank — re-evaluate monthly, scores drift as new data arrives.",
+            "ML Band":           "80% confidence band [q10 — q90]. Wide band = high uncertainty on this stock; treat the score as noisy.",
+            "ML Decile":         "Decile ranking 1-10. Decile 10 = top 10% predicted performers. Decile 1 = bottom 10%.",
             "fundamental_score": "Quality 0-1. ROIC 25% + FCF margin 20% + Rev CAGR 20% + Gross margin 20% + Interest coverage 15%. NaN-safe weighted avg.",
             "DCF Upside":        "(DCF_value - price) / price. Positive = undervalued. FMP /discounted-cash-flow.",
             "ROIC":              "Return on Invested Capital: EBIT*(1-tax) / (equity+net_debt). >15% = competitive moat. Better than ROE.",
@@ -1581,9 +1619,20 @@ def update_screener(n, metric, min_tech, sectors, topn):
     )
 
     # ── 5. Regime banner ─────────────────────────────────────────────
+    # Render the current market regime detected by modules.regime_detector.
+    # Defaults are unified so a partial regime dict still produces a
+    # coherent banner instead of mixing "0%" with "?" placeholders.
     regime = data.get("regime")
     if regime:
         regime_color = regime.get("color", ACCENT)
+        stay_prob = regime.get("stay_probability")
+        stay_prob_str = f"{stay_prob:.0%}" if isinstance(stay_prob, (int, float)) else "N/A"
+        expected_dur = regime.get("expected_duration_days")
+        expected_dur_str = (
+            f"~{expected_dur} trading days"
+            if isinstance(expected_dur, (int, float))
+            else "N/A"
+        )
         banner = html.Div([
             html.Div([
                 html.Span(regime.get("stars", ""), style={
@@ -1599,13 +1648,13 @@ def update_screener(n, metric, min_tech, sectors, topn):
                 }),
             ], style={"display": "flex", "alignItems": "center"}),
             html.Div([
-                html.Span(f"Prob. manter regime: {regime.get('stay_probability', 0):.0%}", style={
+                html.Span(f"P(stay in regime): {stay_prob_str}", style={
                     "fontFamily": FONT_BODY, "fontSize": "11px", "color": MUTED,
                 }),
-                html.Span(f"  ·  Duração esperada: ~{regime.get('expected_duration_days', '?')} dias úteis", style={
+                html.Span(f"  ·  Expected duration: {expected_dur_str}", style={
                     "fontFamily": FONT_BODY, "fontSize": "11px", "color": MUTED,
                 }),
-                html.Span(f"  ·  Actualizado: {regime.get('date', 'N/A')}", style={
+                html.Span(f"  ·  Updated: {regime.get('date', 'N/A')}", style={
                     "fontFamily": FONT_BODY, "fontSize": "11px", "color": MUTED,
                 }),
             ], style={"marginTop": "6px"}),
@@ -1615,10 +1664,15 @@ def update_screener(n, metric, min_tech, sectors, topn):
             "borderRadius": "8px", "padding": "14px 20px",
         })
     else:
+        # Regime detection returned None — most likely missing SPY history
+        # or insufficient observations. See logs from modules.regime_detector
+        # for the exact reason.
         banner = html.Div([
             html.Span("Regime: ", style={"fontFamily": FONT_UI, "color": MUTED}),
-            html.Span("Não calculado — corre ", style={"fontFamily": FONT_UI, "color": MUTED, "fontSize": "12px"}),
-            html.Code("python modules/regime_detector.py", style={"fontSize": "11px"}),
+            html.Span(
+                "Not available — see logs for diagnostic details.",
+                style={"fontFamily": FONT_UI, "color": MUTED, "fontSize": "12px"},
+            ),
         ], style={
             "background": SURFACE, "borderRadius": "8px",
             "padding": "12px 18px", "border": f"1px solid {BORDER}",
