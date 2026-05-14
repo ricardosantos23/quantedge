@@ -27,6 +27,7 @@ Open the UI at http://127.0.0.1:8050 (or the platform-assigned URL).
 
 import logging
 import os
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -824,7 +825,7 @@ app = dash.Dash(
         "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css",
     ],
     suppress_callback_exceptions=True,
-    title="MondayFever",
+    title="QuantEdge",
 )
 
 
@@ -842,12 +843,13 @@ def nav_btn(label, icon_cls, btn_id, active=False):
 
 sidebar = html.Div([
     html.Div([
-        html.Div("M", className="sidebar-logo-icon"),
-        html.Div("MondayFever", className="sidebar-logo-text"),
+        html.Div("Q", className="sidebar-logo-icon"),
+        html.Div("QuantEdge", className="sidebar-logo-text"),
     ], className="sidebar-logo"),
-    nav_btn("Portfolio",    "bi bi-graph-up-arrow", "nav-portfolio", active=True),
-    nav_btn("Screener",     "bi bi-search",         "nav-screener"),
-    nav_btn("Strategy Lab", "bi bi-lightning",      "nav-strategy"),
+    nav_btn("Portfolio", "bi bi-graph-up-arrow",  "nav-portfolio", active=True),
+    nav_btn("Screener",  "bi bi-search",          "nav-screener"),
+    nav_btn("Watchlist", "bi bi-bookmark-star",   "nav-watchlist"),
+    nav_btn("Alerts",    "bi bi-bell",            "nav-alerts"),
     html.Div([
         html.Div(className="sidebar-footer-dot"),
         html.Div("Live data", className="sidebar-footer-text"),
@@ -1084,6 +1086,348 @@ def _weight_slider(label, slider_id, default):
 
 
 # ════════════════════════════════════════════════════════════════════
+#  WATCHLIST + ALERTS — supporting layouts and callbacks
+# ════════════════════════════════════════════════════════════════════
+# Single-user mode: the Watchlist and Alert tables in db.models are
+# keyed by user_name so the platform can support multiple users in the
+# future. Until proper authentication is added, every row is stored
+# under DEFAULT_USER.
+DEFAULT_USER = os.environ.get("QUANTEDGE_USER", "ricardo")
+
+from sqlalchemy import select, delete as sa_delete
+from db.connection import Session as DBSession
+from db.models import Watchlist as WatchlistRow, Alert as AlertRow
+
+
+def _watchlist_rows():
+    """Return the current user's watchlist as a list of dicts."""
+    with DBSession() as s:
+        rows = s.query(WatchlistRow).filter(
+            WatchlistRow.user_name == DEFAULT_USER
+        ).order_by(WatchlistRow.added_at.desc()).all()
+        return [
+            {"ticker": r.ticker, "notes": r.notes or "",
+             "added": r.added_at.strftime("%Y-%m-%d") if r.added_at else ""}
+            for r in rows
+        ]
+
+
+def _active_alert_rows():
+    """Return active (non-triggered) alerts for the current user."""
+    with DBSession() as s:
+        rows = s.query(AlertRow).filter(
+            AlertRow.user_name == DEFAULT_USER,
+            AlertRow.is_active == True,         # noqa: E712
+            AlertRow.triggered == False,        # noqa: E712
+        ).order_by(AlertRow.created_at.desc()).all()
+        return [
+            {"id": r.id, "ticker": r.ticker, "alert_type": r.alert_type,
+             "threshold": float(r.threshold), "email": r.email or "—",
+             "created": r.created_at.strftime("%Y-%m-%d") if r.created_at else ""}
+            for r in rows
+        ]
+
+
+def _triggered_alert_rows(days_back: int = 30):
+    """Return alerts triggered in the last `days_back` days."""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=days_back)
+    with DBSession() as s:
+        rows = s.query(AlertRow).filter(
+            AlertRow.user_name == DEFAULT_USER,
+            AlertRow.triggered == True,         # noqa: E712
+            AlertRow.triggered_at >= cutoff,
+        ).order_by(AlertRow.triggered_at.desc()).all()
+        return [
+            {"ticker": r.ticker, "alert_type": r.alert_type,
+             "threshold": float(r.threshold),
+             "triggered_at": r.triggered_at.strftime("%Y-%m-%d %H:%M")
+                             if r.triggered_at else "—"}
+            for r in rows
+        ]
+
+
+def _watchlist_table_component(rows):
+    if not rows:
+        return html.Div(
+            "No tickers in your watchlist yet. Add one above.",
+            style={"color": MUTED, "fontStyle": "italic", "padding": "12px 0"},
+        )
+    return dash_table.DataTable(
+        id="watchlist-dt",
+        columns=[
+            {"name": "Ticker", "id": "ticker"},
+            {"name": "Notes",  "id": "notes"},
+            {"name": "Added",  "id": "added"},
+        ],
+        data=rows,
+        row_deletable=True,
+        style_table={"overflowX": "auto"},
+        style_cell={"fontFamily": FONT_BODY, "fontSize": "13px", "padding": "10px 12px",
+                    "textAlign": "left", "border": f"1px solid {BORDER}"},
+        style_header={"backgroundColor": SURFACE, "fontWeight": "600",
+                      "color": TEXT, "borderBottom": f"2px solid {BORDER}"},
+        style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#FAFAF8"}],
+    )
+
+
+def _alerts_table_component(rows, table_id, deletable=True, include_triggered_col=False):
+    if not rows:
+        return html.Div(
+            "Nothing to show here yet.",
+            style={"color": MUTED, "fontStyle": "italic", "padding": "12px 0"},
+        )
+    columns = [
+        {"name": "Ticker",    "id": "ticker"},
+        {"name": "Type",      "id": "alert_type"},
+        {"name": "Threshold", "id": "threshold", "type": "numeric",
+         "format": {"specifier": ".2f"}},
+    ]
+    if include_triggered_col:
+        columns.append({"name": "Triggered at", "id": "triggered_at"})
+    else:
+        columns += [
+            {"name": "Email",   "id": "email"},
+            {"name": "Created", "id": "created"},
+        ]
+    return dash_table.DataTable(
+        id=table_id,
+        columns=columns,
+        data=rows,
+        row_deletable=deletable,
+        style_table={"overflowX": "auto"},
+        style_cell={"fontFamily": FONT_BODY, "fontSize": "13px", "padding": "10px 12px",
+                    "textAlign": "left", "border": f"1px solid {BORDER}"},
+        style_header={"backgroundColor": SURFACE, "fontWeight": "600",
+                      "color": TEXT, "borderBottom": f"2px solid {BORDER}"},
+        style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#FAFAF8"}],
+    )
+
+
+def layout_watchlist():
+    return html.Div([
+        page_header("Watchlist", "Track tickers you want to keep an eye on"),
+        card([
+            section_header("Add ticker"),
+            html.Div([
+                dcc.Input(
+                    id="wl-ticker", type="text", placeholder="e.g. NVDA",
+                    className="qe-input",
+                    style={"flex": "0 0 160px", "textTransform": "uppercase"},
+                ),
+                dcc.Input(
+                    id="wl-notes", type="text", placeholder="Notes (optional)",
+                    className="qe-input", style={"flex": "1"},
+                ),
+                primary_btn("Add", "wl-add-btn"),
+            ], style={"display": "flex", "gap": "10px", "alignItems": "center"}),
+            html.Div(id="wl-status"),
+        ]),
+        card([
+            section_header("Your watchlist", "Delete a row by clicking the × on the left"),
+            html.Div(id="wl-table-wrap"),
+        ]),
+    ])
+
+
+def layout_alerts():
+    return html.Div([
+        page_header("Alerts", "Get notified when a price crosses your threshold"),
+        card([
+            section_header("Create alert"),
+            html.Div([
+                dcc.Input(
+                    id="al-ticker", type="text", placeholder="Ticker",
+                    className="qe-input",
+                    style={"flex": "0 0 130px", "textTransform": "uppercase"},
+                ),
+                dcc.Dropdown(
+                    id="al-type",
+                    options=[
+                        {"label": "Price above", "value": "price_above"},
+                        {"label": "Price below", "value": "price_below"},
+                        {"label": "Stop loss",   "value": "stop_loss"},
+                    ],
+                    placeholder="Trigger type",
+                    clearable=False,
+                    className="qe-dropdown",
+                    style={"flex": "0 0 170px"},
+                ),
+                dcc.Input(
+                    id="al-threshold", type="number", placeholder="Threshold (price)",
+                    className="qe-input", style={"flex": "0 0 150px"},
+                ),
+                dcc.Input(
+                    id="al-email", type="email", placeholder="Email (optional)",
+                    className="qe-input", style={"flex": "1"},
+                ),
+                primary_btn("Create", "al-create-btn"),
+            ], style={"display": "flex", "gap": "10px", "alignItems": "center",
+                      "flexWrap": "wrap"}),
+            html.Div(id="al-status"),
+        ]),
+        card([
+            section_header(
+                "Active alerts",
+                "Auto-checked every 15 min by the scheduler. Delete with the ×.",
+            ),
+            html.Div(id="al-active-wrap"),
+        ]),
+        card([
+            section_header("Recently triggered", "Last 30 days"),
+            html.Div(id="al-triggered-wrap"),
+        ]),
+    ])
+
+
+# ── Watchlist callbacks ──────────────────────────────────────────────
+
+@app.callback(
+    Output("wl-table-wrap", "children"),
+    Output("wl-status",     "children"),
+    Output("wl-ticker",     "value"),
+    Output("wl-notes",      "value"),
+    Input("wl-add-btn", "n_clicks"),
+    State("wl-ticker",  "value"),
+    State("wl-notes",   "value"),
+    prevent_initial_call=False,
+)
+def watchlist_add(n_clicks, ticker, notes):
+    status = None
+    if n_clicks and ticker:
+        ticker_norm = ticker.strip().upper()
+        if ticker_norm:
+            try:
+                with DBSession() as s:
+                    existing = s.query(WatchlistRow).filter_by(
+                        user_name=DEFAULT_USER, ticker=ticker_norm,
+                    ).first()
+                    if existing:
+                        status = html.Div(
+                            f"{ticker_norm} is already on your watchlist.",
+                            className="qe-toast error",
+                        )
+                    else:
+                        s.add(WatchlistRow(
+                            user_name=DEFAULT_USER, ticker=ticker_norm,
+                            notes=(notes or "").strip() or None,
+                        ))
+                        s.commit()
+                        status = html.Div(
+                            f"Added {ticker_norm} to your watchlist.",
+                            className="qe-toast success",
+                        )
+            except Exception as e:
+                logger.exception("Watchlist add failed: %s", e)
+                status = html.Div(f"Failed to add: {e}", className="qe-toast error")
+    return _watchlist_table_component(_watchlist_rows()), status, "", ""
+
+
+@app.callback(
+    Output("wl-table-wrap", "children", allow_duplicate=True),
+    Input("watchlist-dt", "data"),
+    State("watchlist-dt", "data_previous"),
+    prevent_initial_call=True,
+)
+def watchlist_handle_delete(current, previous):
+    if previous is None:
+        return dash.no_update
+    current_tickers  = {r["ticker"] for r in (current or [])}
+    previous_tickers = {r["ticker"] for r in (previous or [])}
+    removed = previous_tickers - current_tickers
+    if not removed:
+        return dash.no_update
+    try:
+        with DBSession() as s:
+            for t in removed:
+                s.query(WatchlistRow).filter_by(
+                    user_name=DEFAULT_USER, ticker=t,
+                ).delete()
+            s.commit()
+    except Exception as e:
+        logger.exception("Watchlist delete failed: %s", e)
+    return _watchlist_table_component(_watchlist_rows())
+
+
+# ── Alerts callbacks ──────────────────────────────────────────────
+
+@app.callback(
+    Output("al-active-wrap",    "children"),
+    Output("al-triggered-wrap", "children"),
+    Output("al-status",         "children"),
+    Output("al-ticker",         "value"),
+    Output("al-type",           "value"),
+    Output("al-threshold",      "value"),
+    Output("al-email",          "value"),
+    Input("al-create-btn", "n_clicks"),
+    State("al-ticker",    "value"),
+    State("al-type",      "value"),
+    State("al-threshold", "value"),
+    State("al-email",     "value"),
+    prevent_initial_call=False,
+)
+def alerts_create(n_clicks, ticker, alert_type, threshold, email):
+    status = None
+    if n_clicks:
+        if not ticker or not alert_type or threshold is None:
+            status = html.Div(
+                "Ticker, type and threshold are required.",
+                className="qe-toast error",
+            )
+        else:
+            try:
+                with DBSession() as s:
+                    s.add(AlertRow(
+                        user_name=DEFAULT_USER,
+                        ticker=ticker.strip().upper(),
+                        alert_type=alert_type,
+                        threshold=float(threshold),
+                        email=(email or "").strip() or None,
+                        is_active=True,
+                        triggered=False,
+                    ))
+                    s.commit()
+                status = html.Div(
+                    f"Created {alert_type} alert for "
+                    f"{ticker.strip().upper()} at {threshold:.2f}.",
+                    className="qe-toast success",
+                )
+            except Exception as e:
+                logger.exception("Alert create failed: %s", e)
+                status = html.Div(f"Failed to create: {e}", className="qe-toast error")
+    active = _alerts_table_component(_active_alert_rows(), "al-active-dt", deletable=True)
+    triggered = _alerts_table_component(
+        _triggered_alert_rows(), "al-triggered-dt",
+        deletable=False, include_triggered_col=True,
+    )
+    return active, triggered, status, "", None, None, ""
+
+
+@app.callback(
+    Output("al-active-wrap", "children", allow_duplicate=True),
+    Input("al-active-dt", "data"),
+    State("al-active-dt", "data_previous"),
+    prevent_initial_call=True,
+)
+def alerts_handle_delete(current, previous):
+    if previous is None:
+        return dash.no_update
+    current_ids  = {r["id"] for r in (current or [])}
+    previous_ids = {r["id"] for r in (previous or [])}
+    removed = previous_ids - current_ids
+    if not removed:
+        return dash.no_update
+    try:
+        with DBSession() as s:
+            for alert_id in removed:
+                s.query(AlertRow).filter_by(id=alert_id).delete()
+            s.commit()
+    except Exception as e:
+        logger.exception("Alert delete failed: %s", e)
+    return _alerts_table_component(_active_alert_rows(), "al-active-dt", deletable=True)
+
+
+# ════════════════════════════════════════════════════════════════════
 #  APP LAYOUT
 # ════════════════════════════════════════════════════════════════════
 app.layout = html.Div([
@@ -1102,21 +1446,21 @@ app.layout = html.Div([
     Output("active-tab",    "data"),
     Output("nav-portfolio", "className"),
     Output("nav-screener",  "className"),
-    Output("nav-strategy",  "className"),
+    Output("nav-watchlist", "className"),
+    Output("nav-alerts",    "className"),
     Input("nav-portfolio",  "n_clicks"),
     Input("nav-screener",   "n_clicks"),
-    Input("nav-strategy",   "n_clicks"),
+    Input("nav-watchlist",  "n_clicks"),
+    Input("nav-alerts",     "n_clicks"),
     prevent_initial_call=True,
 )
-def update_nav(_p, _s, _st):
+def update_nav(_p, _s, _w, _a):
     ctx = callback_context
     if not ctx.triggered:
-        return "portfolio", "nav-item active", "nav-item", "nav-item"
+        return "portfolio", "nav-item active", "nav-item", "nav-item", "nav-item"
     tab = ctx.triggered[0]["prop_id"].split(".")[0].replace("nav-", "")
-    return (tab,
-            "nav-item active" if tab == "portfolio" else "nav-item",
-            "nav-item active" if tab == "screener"  else "nav-item",
-            "nav-item active" if tab == "strategy"  else "nav-item")
+    def _cls(t): return "nav-item active" if tab == t else "nav-item"
+    return tab, _cls("portfolio"), _cls("screener"), _cls("watchlist"), _cls("alerts")
 
 
 @app.callback(Output("page-content", "children"), Input("active-tab", "data"))
@@ -1124,7 +1468,8 @@ def render_page(tab):
     tab = tab or "portfolio"
     if tab == "portfolio": return layout_portfolio()
     if tab == "screener":  return layout_screener()
-    if tab == "strategy":  return layout_strategy()
+    if tab == "watchlist": return layout_watchlist()
+    if tab == "alerts":    return layout_alerts()
     return layout_portfolio()
 
 
