@@ -1,12 +1,31 @@
 """
 analytics/technicals.py — Technical feature computation from DB prices.
 
-Changes from original
----------------------
-- Reads prices from PostgreSQL (no yfinance calls)
-- load_prices_from_db() is the new entry point for data loading
-- compute_technical_features() is unchanged — same signals, same weights
+Two public entry points:
+
+* :func:`load_prices_from_db` — Pull OHLCV history from the ``prices``
+  table for one or more tickers.
+* :func:`compute_technical_features` — Derive momentum, volatility,
+  drawdown, trend, RSI, MACD, and a cross-sectional composite score
+  from raw OHLCV data.
+
+Composite score
+---------------
+The composite ``score`` column is a cross-sectional percentile rank
+computed daily across all tickers. It combines six z-scored signals
+with the following weights:
+
+* +0.30 ``mom_12m_z``   — 12-month momentum
+* +0.20 ``ret_6m_z``    — 20-day return
+* +0.15 ``trend_z``     — distance from the 200-period EMA
+* +0.10 ``macd_z``      — MACD line (12/26)
+* −0.20 ``vol_60d_z``   — 60-day realised volatility (penalty)
+* −0.15 ``dd_12m_z``    — 12-month maximum drawdown (penalty)
+
+The same weights are also exposed in ``modules.backtester.DEFAULT_WEIGHTS``
+so the Strategy Lab can re-rank the universe with custom weights.
 """
+
 from datetime import datetime, timedelta
 
 import numpy as np
