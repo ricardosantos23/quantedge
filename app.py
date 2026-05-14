@@ -37,16 +37,14 @@ import dash
 from dash import dcc, html, Input, Output, State, dash_table, callback_context
 import dash_bootstrap_components as dbc
 
-from modules.stop_loss  import compute_stop_recommendations
-from modules.backtester import run_backtest, optimise_weights, benchmark_buyhold, DEFAULT_WEIGHTS
+from modules.stop_loss       import compute_stop_recommendations
+from modules.backtester      import run_backtest, optimise_weights, benchmark_buyhold, DEFAULT_WEIGHTS
 from modules.ml_scorer       import compute_ml_scores
 from modules.regime_detector import compute_regime
-from ingestion   import load_market_data
-from technicals  import compute_technical_features
-from fundamental import compute_fundamentals, _fmp_get
-from portfolio   import build_portfolio_analytics
-from portfolio   import load_transactions
-from portfolio   import get_fx_data
+from analytics.technicals    import compute_technical_features, load_prices_from_db
+from analytics.fundamental   import compute_fundamentals
+from analytics.portfolio     import build_portfolio_analytics, load_transactions, get_fx_data
+from ingestion.universe      import get_universe_df
 
 
 # ── Logging configuration ────────────────────────────────────────────────────
@@ -692,13 +690,15 @@ _cache = {}
 SCREENER_UNIVERSE = 500 # change to "all", a number, or a list
 
 
-def load_all_data(transactions_path, stocks_path, years_back=10):
+def load_all_data(transactions_path, years_back=10):
     if "data" in _cache:
         return _cache["data"]
 
     tx         = load_transactions(transactions_path)
     tickers_tx = tx["ticker"].unique().tolist()
-    stocks_df  = pd.read_csv(stocks_path)
+    # Pull the stock universe from the company_info table (replaces the
+    # legacy stocks_all_pages.csv file).
+    stocks_df  = get_universe_df(active_only=True)
 
     # ── Build screener ticker list from SCREENER_UNIVERSE ────────────
     all_tickers = (
@@ -726,11 +726,11 @@ def load_all_data(transactions_path, stocks_path, years_back=10):
     # Always include portfolio tickers
     tickers_screen = list(set(tickers_screen) | set(tickers_tx))
 
-    print(f"\n  Loading {len(tickers_screen)} tickers ({label})")
+    logger.info("Loading %d tickers (%s)", len(tickers_screen), label)
 
-    prices_port,   _       = load_market_data(tickers_tx, years_back)
-    prices_spy,    _       = load_market_data(["SPY"], years_back)
-    prices_screen, quality = load_market_data(tickers_screen, years_back)
+    prices_port   = load_prices_from_db(tickers_tx,    years_back=years_back)
+    prices_spy    = load_prices_from_db(["SPY"],        years_back=years_back)
+    prices_screen = load_prices_from_db(tickers_screen, years_back=years_back)
 
     prices_all = pd.concat(
         [p for p in [prices_port, prices_spy, prices_screen] if p is not None],
@@ -776,7 +776,7 @@ def load_all_data(transactions_path, stocks_path, years_back=10):
     _cache["data"] = dict(
         transactions=tx, prices=prices_all, prices_port=prices_port,
         df_tech=df_tech, df_fund=df_fund, factor_table=factor_table,
-        pnl=pnl, stops=stops, quality=quality, stocks_df=stocks_df,
+        pnl=pnl, stops=stops, stocks_df=stocks_df,
         fx_data=fx_data, ml_scores=ml_scores, regime=regime,
     )
     return _cache["data"]
@@ -1115,7 +1115,7 @@ def render_page(tab):
 def update_portfolio_header(tab):
     if tab != "portfolio":
         return dash.no_update, dash.no_update
-    data     = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data     = load_all_data("transactions.csv")
     prices_p = data["prices_port"] if data["prices_port"] is not None else pd.DataFrame()
     open_df, _ = compute_holdings_table(data["transactions"], prices_p,
                                        data["df_tech"], data["df_fund"], data["stocks_df"],
@@ -1226,7 +1226,7 @@ def _make_holdings_datatable(df, table_id, pct_col="_unreal_pct"):
 def update_holdings(tab):
     if tab != "portfolio":
         return dash.no_update, dash.no_update, dash.no_update, [], None, [], None
-    data     = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data     = load_all_data("transactions.csv")
     prices_p = data["prices_port"] if data["prices_port"] is not None else pd.DataFrame()
     open_df, closed_df = compute_holdings_table(
         data["transactions"], prices_p,
@@ -1261,7 +1261,7 @@ def update_holdings(tab):
 def update_spy_chart(ticker):
     if not ticker:
         return go.Figure().update_layout(**PLOTLY_THEME)
-    data  = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data  = load_all_data("transactions.csv")
     tx_t  = data["transactions"]
     tx_t  = tx_t[(tx_t["ticker"] == ticker) & (tx_t["type"] == "buy")]
     first = pd.to_datetime(tx_t["date"].min()) if not tx_t.empty else None
@@ -1272,7 +1272,7 @@ def update_spy_chart(ticker):
 def update_stop_table(tab):
     if tab != "portfolio":
         return dash.no_update
-    data  = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data  = load_all_data("transactions.csv")
     stops = data["stops"]
     if stops is None or stops.empty:
         return html.P("No stop data.", style={"color": MUTED, "fontFamily": FONT_UI})
@@ -1288,7 +1288,7 @@ def update_stop_table(tab):
 def update_candle(ticker):
     if not ticker:
         return go.Figure().update_layout(**PLOTLY_THEME)
-    data   = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data   = load_all_data("transactions.csv")
     prices = data["prices_port"]
     stops  = data["stops"]
     df_t   = prices[prices["ticker"] == ticker] if prices is not None else pd.DataFrame()
@@ -1306,7 +1306,7 @@ def update_candle(ticker):
 def populate_sectors(tab):
     if tab != "screener":
         return []
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     sdf     = data["stocks_df"]
     if "Sector" not in sdf.columns:
         return []
@@ -1338,7 +1338,7 @@ def clear_filters(_):
     prevent_initial_call=False,
 )
 def update_screener(n, metric, min_tech, sectors, topn):
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     ft      = data["factor_table"].copy()
     sdf     = data["stocks_df"].copy()
     topn    = int(topn or 50)
@@ -1707,7 +1707,7 @@ def show_weights(mom, ret, trend, macd, vol, dd):
     prevent_initial_call=True,
 )
 def run_bt(n, start, budget, topn, rebal, w_mom, w_ret, w_trend, w_macd, w_vol, w_dd):
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     weights = {"mom_12m_z": w_mom or 0.30, "ret_6m_z": w_ret or 0.20,
                "trend_z": w_trend or 0.15, "macd_z": w_macd or 0.10,
                "vol_60d_z": w_vol or -0.20, "dd_12m_z": w_dd or -0.15}
@@ -1756,7 +1756,7 @@ def run_bt(n, start, budget, topn, rebal, w_mom, w_ret, w_trend, w_macd, w_vol, 
     prevent_initial_call=True,
 )
 def run_optimiser(n, start, budget, topn):
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     results = optimise_weights(df_tech=data["df_tech"], prices=data["prices"],
                                start_date=start or "2015-01-01",
                                monthly_budget=float(budget or 1000),
