@@ -1,29 +1,40 @@
 """
-ingestion/scheduler.py — Background job scheduler + alert checker.
+ingestion/scheduler.py — Background job scheduler and alert checker.
 
-Jobs
-----
-  22:00 UTC daily    → nightly price + FX refresh
-  22:30 UTC daily    → earnings calendar (next 90 days)
-  23:00 UTC Sunday   → universe sync (weekly)
-  every 15 minutes   → check active alerts, fire emails
+Schedule (UTC)
+--------------
+* 22:00 daily           — Nightly price + FX refresh.
+* 22:30 daily           — Earnings calendar sync (next 90 days).
+* 23:00 Sunday          — Stock universe sync (weekly).
+* Every 15 minutes      — Check active alerts, dispatch email notifications.
 
-The scheduler uses a SQLAlchemy job store so:
-  - Jobs survive restarts
-  - Only ONE Gunicorn worker runs each job (no duplicates)
+Persistence model
+-----------------
+The scheduler uses a SQLAlchemy job store backed by the same Postgres
+database as the rest of the application. Two consequences:
+
+* Jobs survive process restarts — pending firings are picked up on
+  the next startup.
+* Only ONE gunicorn worker fires each scheduled job, even when the web
+  service runs with multiple workers (the SQL store serialises lock
+  acquisition).
 
 Usage
 -----
-  Embedded (recommended):
-      from ingestion.scheduler import start_scheduler
-      scheduler = start_scheduler()   # call once in app.py
+Embedded (recommended)::
 
-  Standalone (alternative):
-      python -m ingestion.scheduler
+    from ingestion.scheduler import start_scheduler
+    scheduler = start_scheduler()   # call once in app.py
+
+Standalone (debugging / cron-style runs)::
+
+    python -m ingestion.scheduler
 """
+
+import logging
 import smtplib
 import time
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
 from email.mime.text import MIMEText
 
 from sqlalchemy import text
@@ -33,8 +44,10 @@ import config
 from db.connection import Session, engine
 from db.models import Alert, EarningsCalendar, create_all_tables
 from ingestion.fmp_client import fetch_earnings_calendar
-from ingestion.prices import run_price_ingestion, run_fx_ingestion
+from ingestion.prices import run_fx_ingestion, run_price_ingestion
 from ingestion.universe import run_universe_sync
+
+logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -48,22 +61,22 @@ def send_alert_email(to: str, subject: str, body: str) -> bool:
     Silently skips if SMTP is not configured.
     """
     if not config.SMTP_USER or not config.SMTP_PASS:
-        print(f"  [alert] SMTP not configured — skipping email: {subject}")
+        logger.warning("[alert] SMTP not configured — skipping email: %s", subject)
         return False
     try:
-        msg            = MIMEText(body, "plain", "utf-8")
+        msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
-        msg["From"]    = config.ALERT_FROM
-        msg["To"]      = to
+        msg["From"] = config.ALERT_FROM
+        msg["To"] = to
         with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=15) as s:
             s.ehlo()
             s.starttls()
             s.login(config.SMTP_USER, config.SMTP_PASS)
             s.sendmail(config.ALERT_FROM, [to], msg.as_string())
-        print(f"  [alert] ✓ email sent to {to}: {subject}")
+        logger.info("[alert] email sent to %s: %s", to, subject)
         return True
     except Exception as e:
-        print(f"  [alert] ✗ email failed: {e}")
+        logger.exception("[alert] email failed: %s", e)
         return False
 
 
@@ -137,7 +150,7 @@ def check_and_fire_alerts() -> int:
         s.commit()
 
     if fired_count:
-        print(f"  [alerts] {fired_count} alert(s) fired")
+        logger.info("[alerts] %d alert(s) fired", fired_count)
     return fired_count
 
 
@@ -152,9 +165,11 @@ def run_earnings_sync(days_ahead: int = 90) -> int:
 
     rows = fetch_earnings_calendar(start, end)
     if not rows:
-        print("  [earnings] no data returned")
+        logger.warning("[earnings] no data returned")
         return 0
 
+    # Deduplicate by (ticker, earnings_date) — FMP occasionally returns
+    # the same event multiple times when a company updates guidance.
     seen = set()
     unique_rows = []
     for row in rows:
@@ -163,7 +178,7 @@ def run_earnings_sync(days_ahead: int = 90) -> int:
             seen.add(key)
             unique_rows.append(row)
     rows = unique_rows
-    print(f"  [earnings] {len(rows)} eventos únicos após deduplicação")
+    logger.info("[earnings] %d unique events after deduplication", len(rows))
 
     BATCH = 500
     total_inserted = 0
@@ -185,7 +200,9 @@ def run_earnings_sync(days_ahead: int = 90) -> int:
             total_inserted += len(batch)
         s.commit()
 
-    print(f"  [earnings] {total_inserted} events synced ({start} → {end})")
+    logger.info(
+        "[earnings] %d events synced (%s → %s)", total_inserted, start, end
+    )
     return total_inserted
 
 
@@ -204,7 +221,7 @@ def run_nightly_prices() -> None:
         ).fetchall()]
 
     if not tickers:
-        print("  [nightly] no tickers in DB — run setup.py first")
+        logger.warning("[nightly] no tickers in DB — run setup.py first")
         return
 
     run_price_ingestion(tickers)
@@ -225,12 +242,14 @@ def start_scheduler():
     Returns the scheduler instance (or None if APScheduler is not installed).
     """
     try:
-        from apscheduler.schedulers.background import BackgroundScheduler
-        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
         from apscheduler.executors.pool import ThreadPoolExecutor as APThreadPool
+        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+        from apscheduler.schedulers.background import BackgroundScheduler
     except ImportError:
-        print("  [scheduler] APScheduler not installed — scheduler disabled.")
-        print("  Install with: pip install apscheduler")
+        logger.warning(
+            "[scheduler] APScheduler not installed — scheduler disabled. "
+            "Install with: pip install apscheduler"
+        )
         return None
 
     create_all_tables(engine)
@@ -277,10 +296,9 @@ def start_scheduler():
     )
 
     scheduler.start()
-    print(
-        "  [scheduler] ✓ started — "
-        f"nightly prices @ {config.NIGHTLY_CRON_HOUR:02d}:{config.NIGHTLY_CRON_MINUTE:02d} UTC, "
-        "alerts every 15 min"
+    logger.info(
+        "[scheduler] started — nightly prices @ %02d:%02d UTC, alerts every 15 min",
+        config.NIGHTLY_CRON_HOUR, config.NIGHTLY_CRON_MINUTE,
     )
     return scheduler
 
@@ -292,12 +310,18 @@ def start_scheduler():
 if __name__ == "__main__":
     import signal
 
-    print("Starting scheduler (Ctrl+C to stop)...")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    logger.info("Starting scheduler (Ctrl+C to stop)...")
     sched = start_scheduler()
 
     if sched:
         def _shutdown(sig, frame):
-            print("\nShutting down scheduler...")
+            logger.info("Shutting down scheduler...")
             sched.shutdown()
             raise SystemExit(0)
 

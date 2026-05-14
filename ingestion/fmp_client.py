@@ -1,21 +1,48 @@
 """
-ingestion/fmp_client.py — All FMP API calls.
-Updated for new FMP /stable/ API (August 2025+).
-Old /api/v3/ endpoints no longer work.
+ingestion/fmp_client.py — Single source of truth for all FMP API calls.
+
+This module wraps the Financial Modeling Prep REST API and is the only
+place where outbound HTTP requests to FMP are made. Centralising the
+client gives us:
+
+* One place to update the API key / base URL / timeouts.
+* Consistent retry and rate-limit handling.
+* A stable internal signature for each domain endpoint (prices, FX,
+  fundamentals, earnings, universe) regardless of how FMP renames its
+  underlying URLs.
+
+API version
+-----------
+Targets the FMP ``/stable/`` API (rolled out August 2025). The older
+``/api/v3/`` endpoints have been deprecated and will fail with 404.
+
+Authentication
+--------------
+The API key is read from :data:`config.FMP_API_KEY`, which itself is
+populated from the ``FMP_API_KEY`` environment variable. The client
+raises ``RuntimeError`` rather than returning empty data when the key
+is missing — silent failures here would propagate as confusing NaN
+values into the dashboard.
 """
+
 import json
-import time
+import logging
 import threading
-import urllib.request as _req
+import time
 import urllib.error as _err
-from typing import Any
+import urllib.request as _req
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 import config
 
+logger = logging.getLogger(__name__)
+
+# Reserved for future cross-thread coordination (e.g. shared rate-limit
+# bucket). Currently unused but kept to avoid churn at the call sites.
 _lock = threading.Lock()
 
 
@@ -24,6 +51,27 @@ _lock = threading.Lock()
 # ════════════════════════════════════════════════════════
 
 def get(endpoint: str, params: dict = None, retries: int = None) -> Any:
+    """Make a GET request to the FMP API with retry and rate-limit handling.
+
+    Args:
+        endpoint: Path relative to ``config.FMP_BASE`` (e.g.
+            ``"historical-price-eod/full"``). Do not include a leading
+            slash.
+        params: Query-string parameters. The API key is appended
+            automatically.
+        retries: Override for :data:`config.FMP_RETRIES`. ``None`` uses
+            the configured default.
+
+    Returns:
+        The parsed JSON response — usually ``list`` or ``dict``. Returns
+        ``None`` when the request fails after all retry attempts, when
+        FMP responds with an error envelope, or on unexpected exceptions.
+
+    Raises:
+        RuntimeError: If :data:`config.FMP_API_KEY` is empty or if FMP
+            returns 401/403 (authentication errors). These are
+            unrecoverable and warrant a fast, loud failure.
+    """
     if not config.FMP_API_KEY:
         raise RuntimeError("FMP_API_KEY is not set.")
 
@@ -31,7 +79,7 @@ def get(endpoint: str, params: dict = None, retries: int = None) -> Any:
     all_params = {"apikey": config.FMP_API_KEY}
     if params:
         all_params.update(params)
-    qs  = "&".join(f"{k}={v}" for k, v in all_params.items())
+    qs = "&".join(f"{k}={v}" for k, v in all_params.items())
     url = f"{config.FMP_BASE}/{endpoint}?{qs}"
 
     for attempt in range(n_ret + 1):
@@ -40,18 +88,38 @@ def get(endpoint: str, params: dict = None, retries: int = None) -> Any:
             with _req.urlopen(req, timeout=config.FMP_TIMEOUT) as r:
                 data = json.loads(r.read())
                 if isinstance(data, dict) and "Error Message" in data:
+                    logger.warning(
+                        "FMP error envelope on %s: %s", endpoint, data.get("Error Message")
+                    )
                     return None
                 return data
         except _err.HTTPError as e:
             if e.code in (401, 403):
-                raise RuntimeError(f"FMP API auth error ({e.code}). Check FMP_API_KEY.")
+                raise RuntimeError(
+                    f"FMP API auth error ({e.code}). Check FMP_API_KEY."
+                )
             if e.code == 429:
-                time.sleep(2 ** (attempt + 1))
+                # Exponential backoff on rate-limit responses.
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "FMP rate-limited on %s (attempt %d/%d), sleeping %ds",
+                    endpoint, attempt + 1, n_ret + 1, wait,
+                )
+                time.sleep(wait)
             elif attempt < n_ret:
+                logger.debug(
+                    "FMP HTTP %d on %s (attempt %d/%d), retrying",
+                    e.code, endpoint, attempt + 1, n_ret + 1,
+                )
                 time.sleep(1)
-        except Exception:
+        except Exception as exc:
             if attempt < n_ret:
+                logger.debug(
+                    "FMP request failed on %s (attempt %d/%d): %s",
+                    endpoint, attempt + 1, n_ret + 1, exc,
+                )
                 time.sleep(1)
+    logger.error("FMP request to %s failed after %d attempts", endpoint, n_ret + 1)
     return None
 
 
