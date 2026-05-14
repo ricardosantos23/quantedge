@@ -682,21 +682,20 @@ _cache: dict = {}
 _cache_lock = _threading.Lock()
 
 # ════════════════════════════════════════════════════════════════════
-#  SCREENER UNIVERSE — edit this variable to control which tickers
-#  are loaded into the screener and Strategy Lab.
+#  SCREENER UNIVERSE — controls which tickers are loaded into the
+#  screener and Strategy Lab. Pulled from config.SCREENER_UNIVERSE,
+#  which itself is sourced from the SCREENER_UNIVERSE environment
+#  variable (or .env). Set the variable to one of:
 #
-#  Options:
-#    SCREENER_UNIVERSE = "all"        → all tickers from stocks_all_pages.csv
-#    SCREENER_UNIVERSE = 500          → first N tickers from the CSV (by row order)
-#    SCREENER_UNIVERSE = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
-#                                     → exact list you define
+#    "all"                    → every active ticker in company_info
+#    500                      → first N tickers from the company_info table
+#    "AAPL,MSFT,NVDA,..."     → comma-separated explicit list
 #
 #  Your portfolio tickers are always included regardless of this setting.
 #  First load with "all" (~7000 tickers) takes 20–40 min; subsequent
-#  loads are instant (in-process cache). Use a number or list while
-#  developing, switch to "all" for a full screener run.
+#  loads are instant thanks to the in-process cache.
 # ════════════════════════════════════════════════════════════════════
-SCREENER_UNIVERSE = 500 # change to "all", a number, or a list
+from config import SCREENER_UNIVERSE
 
 
 def load_all_data(transactions_path, years_back=10):

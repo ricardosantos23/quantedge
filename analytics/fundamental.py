@@ -73,8 +73,17 @@ def _compute_scores(df: pd.DataFrame) -> pd.DataFrame:
     for c in _numeric + _integer:
         if c not in df.columns:
             df[c] = np.nan
+
+    # Force numeric dtype on every score-related column. Without this,
+    # columns that come back from FMP as mixed None / NaN / float — or
+    # columns we just filled with np.nan above — stay as `object` dtype.
+    # pandas .rank() raises "No matching signature found" on object
+    # dtype under Python 3.14 because the Cython algos.rank_1d lookup
+    # has no signature for object Series.
+    for c in _numeric:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in _integer:
-        df[c] = df[c].fillna(0)
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
 
     df["roic"]              = df["roic"].clip(-0.3, 0.6)
     df["fcf_margin"]        = df["fcf_margin"].clip(-0.5, 0.6)
