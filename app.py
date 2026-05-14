@@ -670,7 +670,16 @@ def compute_portfolio_kpis(pnl_df, holdings_df, transactions, fx_data=None):
 # ════════════════════════════════════════════════════════════════════
 #  DATA LOADER
 # ════════════════════════════════════════════════════════════════════
-_cache = {}
+# The cache is shared across every Dash callback. Without a lock, multiple
+# callbacks firing concurrently on the first request would all see an
+# empty cache and each kick off the full FMP refresh in parallel — which
+# multiplied API calls 3-6x and caused cascading rate-limit failures.
+# The lock + double-checked pattern guarantees the expensive load runs
+# exactly once; subsequent callers simply read the populated dict.
+import threading as _threading
+
+_cache: dict = {}
+_cache_lock = _threading.Lock()
 
 # ════════════════════════════════════════════════════════════════════
 #  SCREENER UNIVERSE — edit this variable to control which tickers
@@ -691,9 +700,20 @@ SCREENER_UNIVERSE = 500 # change to "all", a number, or a list
 
 
 def load_all_data(transactions_path, years_back=10):
+    # Fast path: cache already populated, no lock contention.
     if "data" in _cache:
         return _cache["data"]
 
+    # Slow path: only one thread does the heavy load; the rest wait and
+    # then return the populated cache.
+    with _cache_lock:
+        if "data" in _cache:
+            return _cache["data"]
+        return _load_all_data_locked(transactions_path, years_back)
+
+
+def _load_all_data_locked(transactions_path, years_back):
+    """Internal helper. Caller MUST hold ``_cache_lock``."""
     tx         = load_transactions(transactions_path)
     tickers_tx = tx["ticker"].unique().tolist()
     # Pull the stock universe from the company_info table (replaces the
@@ -744,7 +764,7 @@ def load_all_data(transactions_path, years_back=10):
     # For SCREENER_UNIVERSE="all" (~7000 tickers) this will take a while;
     # set SCREENER_UNIVERSE to a number or list for faster development runs.
     all_fund_tickers = list(set(tickers_screen) | set(tickers_tx))
-    print(f"  Fundamentals for {len(all_fund_tickers)} tickers...")
+    logger.info("Fundamentals for %d tickers...", len(all_fund_tickers))
     df_fund = compute_fundamentals(all_fund_tickers)
 
     df_tech_last = (
