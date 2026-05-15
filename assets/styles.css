@@ -1,0 +1,183 @@
+/* ================================================================
+   QuantEdge — Forest Light layout
+   Dash auto-loads every .css file under /assets at startup.
+   Keep this file's classes in sync with the IDs/classes set
+   inline in app.py.
+   ================================================================ */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    padding: 0;
+    background: #FAFAF8;          /* BG */
+    color: #1A1A18;               /* TEXT */
+    font-family: 'DM Sans', system-ui, sans-serif;
+}
+
+/* ---------- Left sidebar ---------- */
+.sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 220px;
+    height: 100vh;
+    background: #F0EDE6;          /* SURFACE */
+    border-right: 1px solid #D4CFC6;
+    padding: 26px 16px;
+    display: flex;
+    flex-direction: column;
+    z-index: 1000;
+}
+
+.sidebar-logo {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    margin-bottom: 36px;
+    padding: 0 4px;
+}
+
+.sidebar-logo-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 7px;
+    background: #2D6A4F;          /* ACCENT */
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Libre Baskerville', Georgia, serif;
+    font-weight: 700;
+    font-size: 17px;
+    letter-spacing: -0.5px;
+}
+
+.sidebar-logo-text {
+    font-family: 'Libre Baskerville', Georgia, serif;
+    font-weight: 700;
+    font-size: 17px;
+    color: #1A1A18;
+    letter-spacing: -0.2px;
+}
+
+.nav-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    margin: 2px 0;
+    border-radius: 7px;
+    background: transparent;
+    border: none;
+    color: #7A7670;               /* MUTED */
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+    width: 100%;
+    transition: background-color .15s ease, color .15s ease;
+}
+
+.nav-item:hover {
+    background: rgba(45, 106, 79, 0.07);
+    color: #1A1A18;
+}
+
+.nav-item.active {
+    background: rgba(45, 106, 79, 0.12);
+    color: #2D6A4F;
+    font-weight: 600;
+}
+
+.nav-item i {
+    font-size: 15px;
+    width: 18px;
+    text-align: center;
+}
+
+.nav-label {
+    flex: 1;
+}
+
+.sidebar-footer {
+    margin-top: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px 4px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 11px;
+    color: #7A7670;
+    border-top: 1px solid #D4CFC6;
+}
+
+.sidebar-footer-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #2D6A4F;
+    box-shadow: 0 0 0 4px rgba(45, 106, 79, 0.15);
+}
+
+/* ---------- Main content area ---------- */
+.main-content {
+    margin-left: 220px;
+    padding: 32px 40px;
+    min-height: 100vh;
+    max-width: 1400px;
+}
+
+/* ---------- Forms (used by Watchlist + Alerts) ---------- */
+.qe-input {
+    background: #FFFFFF;
+    border: 1px solid #D4CFC6;
+    border-radius: 6px;
+    padding: 9px 12px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    color: #1A1A18;
+    outline: none;
+    transition: border-color .15s ease;
+}
+
+.qe-input:focus {
+    border-color: #2D6A4F;
+}
+
+.qe-input::placeholder {
+    color: #B5AFA5;
+}
+
+/* Dropdown component overrides */
+.qe-dropdown .Select-control,
+.qe-dropdown .Select-value {
+    background: #FFFFFF !important;
+    border-color: #D4CFC6 !important;
+    border-radius: 6px !important;
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 13px !important;
+}
+
+/* ---------- Toast / status messages ---------- */
+.qe-toast {
+    padding: 9px 14px;
+    border-radius: 6px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 13px;
+    margin-top: 12px;
+    display: inline-block;
+}
+
+.qe-toast.success {
+    background: rgba(45, 106, 79, 0.10);
+    color: #2D6A4F;
+    border: 1px solid rgba(45, 106, 79, 0.30);
+}
+
+.qe-toast.error {
+    background: rgba(192, 57, 43, 0.10);
+    color: #C0392B;
+    border: 1px solid rgba(192, 57, 43, 0.30);
+}

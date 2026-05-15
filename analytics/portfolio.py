@@ -1,20 +1,40 @@
 """
-analytics/portfolio.py — Portfolio P&L and holdings analytics.
+analytics/portfolio.py — Portfolio P&L, holdings, and KPI analytics.
 
-Changes from original
----------------------
-- get_fx_data()           reads from DB fx_rates table (not yfinance)
-- load_portfolio_prices() reads from DB prices table
-- All other logic (build_positions, compute_pnl, compute_holdings_table,
-  compute_portfolio_kpis) is unchanged.
+This module reads the user's trades from ``transactions.csv`` and joins
+them with price and FX data from the database to produce:
+
+* Per-ticker open positions with unrealised P&L, weights, and split-
+  adjusted entry costs.
+* Closed positions with realised P&L.
+* A daily portfolio P&L series.
+* Headline KPIs (total return, CAGR, Sharpe, Sortino, day P&L).
+
+FX handling
+-----------
+The ``fx_rates`` table stores prices in the FMP convention (e.g.
+``EURUSD = 1.08`` means 1 EUR buys 1.08 USD). This module inverts the
+rate so every downstream calculation works in EUR per 1 foreign unit.
+
+Stock splits
+------------
+Splits are still looked up on demand via :mod:`yfinance` because the
+event is rare and the data fits in a small in-process cache. No price
+queries are issued — only ``ticker.splits``.
 """
+
+from __future__ import annotations
+
+import logging
+
 import numpy as np
 import pandas as pd
+import yfinance as _yf   # kept only for stock-split lookup; no price calls
 from sqlalchemy import text
 
 from db.connection import Session
 
-import yfinance as _yf   # kept only for stock split lookup; no price calls
+logger = logging.getLogger(__name__)
 
 _splits_cache: dict = {}
 
@@ -67,14 +87,18 @@ def get_fx_data(currencies: list[str], start_date) -> dict:
             if rows:
                 df = pd.DataFrame(rows, columns=["date", "fx"])
                 df["date"] = pd.to_datetime(df["date"])
-                df["fx"]   = 1.0 / df["fx"]   # EUR per 1 foreign unit
+                df["fx"] = 1.0 / df["fx"]   # convert to EUR per 1 foreign unit
                 fx_data[c] = df
             else:
-                print(f"  [portfolio] WARNING: no FX data for {pair} in DB. "
-                      f"Run: python -m ingestion.prices (will include FX)")
+                logger.warning(
+                    "[portfolio] No FX data for %s in DB. Run "
+                    "`python -m ingestion.prices` to backfill; falling back "
+                    "to rate=1.0 (positions in this currency will be unscaled).",
+                    pair,
+                )
                 fx_data[c] = pd.DataFrame({
                     "date": [pd.Timestamp.today()],
-                    "fx":   [1.0],
+                    "fx": [1.0],
                 })
 
     return fx_data

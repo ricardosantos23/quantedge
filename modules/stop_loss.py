@@ -1,25 +1,44 @@
 """
-stop_loss.py
-============
-Backtests three stop-loss strategies per ticker:
-  1. ATR-based stop   (price - N * ATR14)
-  2. Trailing stop    (peak * (1 - pct))
-  3. Fixed % stop     (entry * (1 - pct))
+modules/stop_loss.py — Per-ticker stop-loss strategy comparison and sizing.
 
-For each strategy + parameter combo, measures:
-  - Total return
-  - Max drawdown
-  - Win rate
-  - Profit factor
-  - Expectancy  ← optimisation target
+For every active position in the portfolio, this module backtests three
+families of stop-loss strategies and recommends the configuration that
+maximises expectancy. The recommendation surfaces on the Portfolio tab
+of the dashboard.
 
-Returns the optimal strategy per ticker plus a unified
-recommendation DataFrame for the dashboard.
+Strategies
+----------
+1. **ATR stop**       — ``price - N * ATR(14)``. Adapts to realised
+   volatility; tighter in calm markets, wider in noisy ones.
+2. **Trailing stop**  — ``peak_so_far * (1 - pct)``. Locks in gains
+   without giving back more than a fixed fraction from the high.
+3. **Fixed-percent**  — ``entry_price * (1 - pct)``. Simple,
+   predictable, but does not adapt to volatility.
+
+Metrics computed per (strategy, parameter) combination:
+
+* Total return         — Compounded across all simulated trades.
+* Maximum drawdown     — On the cumulative-return equity curve.
+* Win rate             — Fraction of trades with positive return.
+* Profit factor        — ``(avg_win * n_wins) / (avg_loss * n_losses)``.
+* Expectancy           — ``W * avg_win - (1 - W) * avg_loss``. **The
+  optimisation target**: positive expectancy is the necessary
+  condition for a strategy to be worth running.
+
+Public API
+----------
+* :func:`compute_stop_recommendations` — Top-level entry used by
+  ``app.py`` to build the recommendations table.
+* :func:`find_optimal_stop`           — Best configuration for a single
+  ticker.
+* :func:`kelly_criterion`             — Position-sizing helper that
+  caps at 25% to keep half-Kelly under 12.5%.
 """
+
+from itertools import product
 
 import numpy as np
 import pandas as pd
-from itertools import product
 
 
 # ─────────────────────────────────────────

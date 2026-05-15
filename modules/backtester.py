@@ -1,27 +1,37 @@
 """
-backtester.py
-=============
-Simulates a monthly DCA strategy guided by the composite score.
+modules/backtester.py — Monthly DCA backtester driven by the composite score.
 
-Flow:
-  1.  Each month, rank all stocks by weighted composite score
-  2.  Allocate monthly_budget across top N stocks (equal weight)
-  3.  Buy fractional shares at month-open price
-  4.  Track portfolio value daily
-  5.  Optionally rebalance every R months
+Simulates a dollar-cost-averaging strategy that, on a configurable
+rebalance cadence, ranks the universe by a weighted composite score
+and allocates the monthly budget across the top N tickers.
 
-Score weights are tunable → used by the optimiser to find the
-parameter set that maximises Sharpe ratio (or total return).
+Workflow
+--------
+1. Each rebalance month, rank every ticker by the weighted composite
+   z-score combining momentum, return, trend, MACD, volatility, and
+   drawdown.
+2. Allocate ``monthly_budget`` equally across the top N tickers.
+3. Buy fractional shares at the month-open price.
+4. Track portfolio value daily and log every buy/sell with rationale.
+5. Optionally rebalance every R months (default 1 → every month).
 
-Returns:
-  - equity_curve  : daily portfolio value
-  - trade_log     : every buy/sell with rationale
-  - summary       : CAGR, Sharpe, Max DD, Win Rate, Profit Factor
+Public API
+----------
+* :func:`run_backtest`        — Core simulation; returns equity curve,
+  trade log, and a summary metrics dict.
+* :func:`optimise_weights`    — Grid-search the weight vector to
+  maximise a chosen metric (Sharpe by default).
+* :func:`benchmark_buyhold`   — DCA into a single benchmark ticker
+  (SPY by default) to produce a comparable equity curve.
+
+Score weights are exposed via :data:`DEFAULT_WEIGHTS` so the Strategy
+Lab UI can override them with sliders before each run.
 """
+
+from itertools import product
 
 import numpy as np
 import pandas as pd
-from itertools import product
 
 
 # ─────────────────────────────────────────

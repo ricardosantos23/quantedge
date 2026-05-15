@@ -1,20 +1,24 @@
 """
-ingestion/universe.py — Sync FMP stock universe → company_info table.
+ingestion/universe.py — Sync the FMP stock universe into ``company_info``.
 
-Replaces stocks_all_pages.csv entirely.
+The ``company_info`` table is the single source of truth for available
+tickers and their metadata (name, sector, industry, market cap,
+exchange, country). This module fully replaces the legacy
+``stocks_all_pages.csv`` file.
 
-Run on setup (once), then weekly via the scheduler.
-The company_info table is the single source of truth for:
-  - available tickers
-  - company names
-  - sectors / industries
-  - market caps
-  - exchanges / countries
+Cadence
+-------
+* On first setup, run once via :func:`run_universe_sync` to populate
+  every ticker.
+* Re-run weekly via the scheduler (Sunday 23:00 UTC) to pick up new
+  listings, delistings, and metadata changes.
 
-Standalone usage
-----------------
+Standalone usage::
+
     python -m ingestion.universe
 """
+
+import logging
 import time
 from datetime import datetime
 
@@ -23,7 +27,9 @@ from sqlalchemy.dialects.postgresql import insert
 
 from db.connection import Session, engine
 from db.models import CompanyInfo, IngestionLog, create_all_tables
-from ingestion.fmp_client import fetch_stock_list, fetch_company_profiles
+from ingestion.fmp_client import fetch_company_profiles, fetch_stock_list
+
+logger = logging.getLogger(__name__)
 
 
 def run_universe_sync(enrich_profiles: bool = True) -> int:
@@ -37,10 +43,10 @@ def run_universe_sync(enrich_profiles: bool = True) -> int:
     create_all_tables(engine)
     t0 = time.time()
 
-    print("\n  [universe] fetching stock list from FMP...")
+    logger.info("[universe] fetching stock list from FMP...")
     stocks = fetch_stock_list()
     if not stocks:
-        print("  [universe] ✗ no data returned — check FMP_API_KEY and plan.")
+        logger.error("[universe] no data returned — check FMP_API_KEY and plan")
         return 0
 
     # ── Step 1: upsert basic info ─────────────────────────────────────
@@ -59,12 +65,15 @@ def run_universe_sync(enrich_profiles: bool = True) -> int:
         s.execute(stmt)
         s.commit()
 
-    print(f"  [universe] {len(stocks)} tickers upserted (basic info)")
+    logger.info("[universe] %d tickers upserted (basic info)", len(stocks))
 
     # ── Step 2: enrich stocks (not ETFs) with profile data ────────────
     if enrich_profiles:
         stock_tickers = [s["ticker"] for s in stocks if not s.get("is_etf")]
-        print(f"  [universe] enriching {len(stock_tickers)} profiles (sector, market cap)...")
+        logger.info(
+            "[universe] enriching %d profiles (sector, market cap)...",
+            len(stock_tickers),
+        )
         profiles = fetch_company_profiles(stock_tickers)
 
         if profiles:
@@ -84,7 +93,7 @@ def run_universe_sync(enrich_profiles: bool = True) -> int:
                 )
                 s.execute(stmt2)
                 s.commit()
-            print(f"  [universe] {len(profiles)} profiles enriched")
+            logger.info("[universe] %d profiles enriched", len(profiles))
 
     duration = time.time() - t0
     with Session() as s:
@@ -97,7 +106,7 @@ def run_universe_sync(enrich_profiles: bool = True) -> int:
         ))
         s.commit()
 
-    print(f"  [universe] done in {duration:.0f}s")
+    logger.info("[universe] done in %.0fs", duration)
     return len(stocks)
 
 
@@ -133,4 +142,9 @@ def get_universe_df(
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     run_universe_sync()

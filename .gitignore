@@ -58,6 +58,7 @@ coverage.xml
 # ---- Editores / IDEs ----
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~

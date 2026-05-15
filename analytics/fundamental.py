@@ -1,15 +1,41 @@
 """
-analytics/fundamental.py — Fundamental scores backed by DB cache.
+analytics/fundamental.py — Cached fundamental scores backed by Postgres.
 
-Flow
-----
-1. load_fundamentals_from_db()  — instant, reads cached rows
-2. refresh_fundamentals()       — fetches stale/missing tickers from FMP,
-                                  writes to DB, returns updated DataFrame
-3. compute_fundamentals()       — drop-in replacement for original function
+Two-tier flow
+-------------
+1. :func:`load_fundamentals_from_db` — Instant read of every cached row.
+2. :func:`refresh_fundamentals`     — Fetch stale or missing tickers
+   from the FMP API, score them, and upsert the result back into the
+   ``fundamentals`` table.
+3. :func:`compute_fundamentals`     — Public API used by ``app.py``;
+   wraps the refresh step and returns display-formatted column names.
 
-Staleness threshold: 24 hours by default (fundamentals don't change daily).
+Cache freshness
+---------------
+Fundamentals are refreshed at most once per ``stale_hours`` (default
+24h). They do not change intraday, so this keeps FMP usage low while
+guaranteeing the dashboard never serves stale data older than one
+business day.
+
+Composite score
+---------------
+The ``fundamental_score`` column is a NaN-safe weighted average of five
+quality signals, each cross-sectionally percentile-ranked:
+
+* 0.25 ROIC
+* 0.20 FCF margin
+* 0.20 Revenue 3-year CAGR
+* 0.20 Gross margin
+* 0.15 Interest coverage
+
+Missing signals contribute zero weight rather than dragging the score
+down, so a company with strong ROIC/FCF but missing growth data still
+ranks consistently.
 """
+
+from __future__ import annotations
+
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
@@ -20,6 +46,8 @@ from sqlalchemy.dialects.postgresql import insert
 from db.connection import Session
 from db.models import Fundamental
 from ingestion.fmp_client import fetch_fundamentals_one
+
+logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -45,8 +73,17 @@ def _compute_scores(df: pd.DataFrame) -> pd.DataFrame:
     for c in _numeric + _integer:
         if c not in df.columns:
             df[c] = np.nan
+
+    # Force numeric dtype on every score-related column. Without this,
+    # columns that come back from FMP as mixed None / NaN / float — or
+    # columns we just filled with np.nan above — stay as `object` dtype.
+    # pandas .rank() raises "No matching signature found" on object
+    # dtype under Python 3.14 because the Cython algos.rank_1d lookup
+    # has no signature for object Series.
+    for c in _numeric:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in _integer:
-        df[c] = df[c].fillna(0)
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
 
     df["roic"]              = df["roic"].clip(-0.3, 0.6)
     df["fcf_margin"]        = df["fcf_margin"].clip(-0.5, 0.6)
@@ -218,10 +255,10 @@ def refresh_fundamentals(
     if not to_refresh:
         return load_fundamentals_from_db(tickers)
 
-    print(f"\n  [fundamentals] refreshing {len(to_refresh)} tickers...")
+    logger.info("[fundamentals] refreshing %d tickers", len(to_refresh))
     results = []
-    done    = 0
-    total   = len(to_refresh)
+    done = 0
+    total = len(to_refresh)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(fetch_fundamentals_one, t): t for t in to_refresh}
@@ -230,6 +267,8 @@ def refresh_fundamentals(
             if res:
                 results.append(res)
             done += 1
+            # Inline progress on stdout for interactive runs; one
+            # completion line goes to the logger for production.
             print(f"\r  [fundamentals] {int(done / total * 100)}%  ", end="", flush=True)
     print()
 
@@ -238,6 +277,7 @@ def refresh_fundamentals(
             pd.DataFrame(results).replace([np.inf, -np.inf], np.nan)
         )
         _upsert_fundamentals(scored)
+        logger.info("[fundamentals] refresh complete — %d tickers updated", len(results))
 
     return load_fundamentals_from_db(tickers)
 

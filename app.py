@@ -1,9 +1,33 @@
 """
-app.py  —  MondayFever Dashboard
-================================
-Run:  python app.py
-Then open:  http://127.0.0.1:8050
+app.py — QuantEdge Dashboard (Dash + Plotly).
+
+Main entry point for the QuantEdge quantitative analytics web app. Wires
+together the analytics, modules, and ingestion packages into a single
+Dash application served by Flask (and gunicorn in production).
+
+The app exposes three tabs:
+
+* **Portfolio**   — Real-time P&L, holdings, FX, sector allocation, and
+  stop-loss recommendations for the user's actual trades.
+* **Screener**    — Multi-factor ranking table combining technical,
+  fundamental, and ML scores, plus the current market-regime banner.
+* **Strategy Lab** — Interactive backtest of a DCA strategy with live
+  weight sliders and a weight optimiser.
+
+Run locally:
+
+    python app.py
+
+Run in production:
+
+    gunicorn --config gunicorn_config.py app:server
+
+Open the UI at http://127.0.0.1:8050 (or the platform-assigned URL).
 """
+
+import logging
+import os
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -14,16 +38,29 @@ import dash
 from dash import dcc, html, Input, Output, State, dash_table, callback_context
 import dash_bootstrap_components as dbc
 
-from modules.stop_loss  import compute_stop_recommendations
-from modules.backtester import run_backtest, optimise_weights, benchmark_buyhold, DEFAULT_WEIGHTS
+from modules.stop_loss       import compute_stop_recommendations
+from modules.backtester      import run_backtest, optimise_weights, benchmark_buyhold, DEFAULT_WEIGHTS
 from modules.ml_scorer       import compute_ml_scores
 from modules.regime_detector import compute_regime
-from ingestion   import load_market_data
-from technicals  import compute_technical_features
-from fundamental import compute_fundamentals, _fmp_get
-from portfolio   import build_portfolio_analytics
-from portfolio   import load_transactions
-from portfolio   import get_fx_data
+from analytics.technicals    import compute_technical_features, load_prices_from_db
+from analytics.fundamental   import compute_fundamentals
+from analytics.portfolio     import build_portfolio_analytics, load_transactions, get_fx_data
+from ingestion.universe      import get_universe_df
+
+
+# ── Logging configuration ────────────────────────────────────────────────────
+# Configured once at the application entry point. Library modules use
+# logging.getLogger(__name__) and inherit this configuration automatically.
+# In production (gunicorn on Railway/Render/Heroku) the logs stream to
+# stdout and are captured by the platform's log viewer.
+
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("quantedge.app")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -634,33 +671,54 @@ def compute_portfolio_kpis(pnl_df, holdings_df, transactions, fx_data=None):
 # ════════════════════════════════════════════════════════════════════
 #  DATA LOADER
 # ════════════════════════════════════════════════════════════════════
-_cache = {}
+# The cache is shared across every Dash callback. Without a lock, multiple
+# callbacks firing concurrently on the first request would all see an
+# empty cache and each kick off the full FMP refresh in parallel — which
+# multiplied API calls 3-6x and caused cascading rate-limit failures.
+# The lock + double-checked pattern guarantees the expensive load runs
+# exactly once; subsequent callers simply read the populated dict.
+import threading as _threading
+
+_cache: dict = {}
+_cache_lock = _threading.Lock()
 
 # ════════════════════════════════════════════════════════════════════
-#  SCREENER UNIVERSE — edit this variable to control which tickers
-#  are loaded into the screener and Strategy Lab.
+#  SCREENER UNIVERSE — controls which tickers are loaded into the
+#  screener and Strategy Lab. Pulled from config.SCREENER_UNIVERSE,
+#  which itself is sourced from the SCREENER_UNIVERSE environment
+#  variable (or .env). Set the variable to one of:
 #
-#  Options:
-#    SCREENER_UNIVERSE = "all"        → all tickers from stocks_all_pages.csv
-#    SCREENER_UNIVERSE = 500          → first N tickers from the CSV (by row order)
-#    SCREENER_UNIVERSE = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
-#                                     → exact list you define
+#    "all"                    → every active ticker in company_info
+#    500                      → first N tickers from the company_info table
+#    "AAPL,MSFT,NVDA,..."     → comma-separated explicit list
 #
 #  Your portfolio tickers are always included regardless of this setting.
 #  First load with "all" (~7000 tickers) takes 20–40 min; subsequent
-#  loads are instant (in-process cache). Use a number or list while
-#  developing, switch to "all" for a full screener run.
+#  loads are instant thanks to the in-process cache.
 # ════════════════════════════════════════════════════════════════════
-SCREENER_UNIVERSE = 500 # change to "all", a number, or a list
+from config import SCREENER_UNIVERSE
 
 
-def load_all_data(transactions_path, stocks_path, years_back=10):
+def load_all_data(transactions_path, years_back=10):
+    # Fast path: cache already populated, no lock contention.
     if "data" in _cache:
         return _cache["data"]
 
+    # Slow path: only one thread does the heavy load; the rest wait and
+    # then return the populated cache.
+    with _cache_lock:
+        if "data" in _cache:
+            return _cache["data"]
+        return _load_all_data_locked(transactions_path, years_back)
+
+
+def _load_all_data_locked(transactions_path, years_back):
+    """Internal helper. Caller MUST hold ``_cache_lock``."""
     tx         = load_transactions(transactions_path)
     tickers_tx = tx["ticker"].unique().tolist()
-    stocks_df  = pd.read_csv(stocks_path)
+    # Pull the stock universe from the company_info table (replaces the
+    # legacy stocks_all_pages.csv file).
+    stocks_df  = get_universe_df(active_only=True)
 
     # ── Build screener ticker list from SCREENER_UNIVERSE ────────────
     all_tickers = (
@@ -688,11 +746,11 @@ def load_all_data(transactions_path, stocks_path, years_back=10):
     # Always include portfolio tickers
     tickers_screen = list(set(tickers_screen) | set(tickers_tx))
 
-    print(f"\n  Loading {len(tickers_screen)} tickers ({label})")
+    logger.info("Loading %d tickers (%s)", len(tickers_screen), label)
 
-    prices_port,   _       = load_market_data(tickers_tx, years_back)
-    prices_spy,    _       = load_market_data(["SPY"], years_back)
-    prices_screen, quality = load_market_data(tickers_screen, years_back)
+    prices_port   = load_prices_from_db(tickers_tx,    years_back=years_back)
+    prices_spy    = load_prices_from_db(["SPY"],        years_back=years_back)
+    prices_screen = load_prices_from_db(tickers_screen, years_back=years_back)
 
     prices_all = pd.concat(
         [p for p in [prices_port, prices_spy, prices_screen] if p is not None],
@@ -706,7 +764,7 @@ def load_all_data(transactions_path, stocks_path, years_back=10):
     # For SCREENER_UNIVERSE="all" (~7000 tickers) this will take a while;
     # set SCREENER_UNIVERSE to a number or list for faster development runs.
     all_fund_tickers = list(set(tickers_screen) | set(tickers_tx))
-    print(f"  Fundamentals for {len(all_fund_tickers)} tickers...")
+    logger.info("Fundamentals for %d tickers...", len(all_fund_tickers))
     df_fund = compute_fundamentals(all_fund_tickers)
 
     df_tech_last = (
@@ -718,10 +776,12 @@ def load_all_data(transactions_path, stocks_path, years_back=10):
     factor_table = df_tech_last.copy()
 
     if prices_port is not None:
-        pp = prices_port.copy()
-        if "price" not in pp.columns:
-            pp = pp.rename(columns={"close": "price"})
-        pnl = build_portfolio_analytics(transactions_path, pp)
+        # Pass the raw price frame; build_positions() internally selects
+        # adj_close (preferred) or close and renames it to "price". A
+        # pre-rename here would create two columns named "price" and
+        # crash with "Cannot set a DataFrame with multiple columns to
+        # the single column price_eur".
+        pnl = build_portfolio_analytics(transactions_path, prices_port)
     else:
         pnl = pd.DataFrame()
 
@@ -738,7 +798,7 @@ def load_all_data(transactions_path, stocks_path, years_back=10):
     _cache["data"] = dict(
         transactions=tx, prices=prices_all, prices_port=prices_port,
         df_tech=df_tech, df_fund=df_fund, factor_table=factor_table,
-        pnl=pnl, stops=stops, quality=quality, stocks_df=stocks_df,
+        pnl=pnl, stops=stops, stocks_df=stocks_df,
         fx_data=fx_data, ml_scores=ml_scores, regime=regime,
     )
     return _cache["data"]
@@ -765,7 +825,7 @@ app = dash.Dash(
         "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css",
     ],
     suppress_callback_exceptions=True,
-    title="MondayFever",
+    title="QuantEdge",
 )
 
 
@@ -783,12 +843,13 @@ def nav_btn(label, icon_cls, btn_id, active=False):
 
 sidebar = html.Div([
     html.Div([
-        html.Div("M", className="sidebar-logo-icon"),
-        html.Div("MondayFever", className="sidebar-logo-text"),
+        html.Div("Q", className="sidebar-logo-icon"),
+        html.Div("QuantEdge", className="sidebar-logo-text"),
     ], className="sidebar-logo"),
-    nav_btn("Portfolio",    "bi bi-graph-up-arrow", "nav-portfolio", active=True),
-    nav_btn("Screener",     "bi bi-search",         "nav-screener"),
-    nav_btn("Strategy Lab", "bi bi-lightning",      "nav-strategy"),
+    nav_btn("Portfolio", "bi bi-graph-up-arrow",  "nav-portfolio", active=True),
+    nav_btn("Screener",  "bi bi-search",          "nav-screener"),
+    nav_btn("Watchlist", "bi bi-bookmark-star",   "nav-watchlist"),
+    nav_btn("Alerts",    "bi bi-bell",            "nav-alerts"),
     html.Div([
         html.Div(className="sidebar-footer-dot"),
         html.Div("Live data", className="sidebar-footer-text"),
@@ -1025,6 +1086,348 @@ def _weight_slider(label, slider_id, default):
 
 
 # ════════════════════════════════════════════════════════════════════
+#  WATCHLIST + ALERTS — supporting layouts and callbacks
+# ════════════════════════════════════════════════════════════════════
+# Single-user mode: the Watchlist and Alert tables in db.models are
+# keyed by user_name so the platform can support multiple users in the
+# future. Until proper authentication is added, every row is stored
+# under DEFAULT_USER.
+DEFAULT_USER = os.environ.get("QUANTEDGE_USER", "ricardo")
+
+from sqlalchemy import select, delete as sa_delete
+from db.connection import Session as DBSession
+from db.models import Watchlist as WatchlistRow, Alert as AlertRow
+
+
+def _watchlist_rows():
+    """Return the current user's watchlist as a list of dicts."""
+    with DBSession() as s:
+        rows = s.query(WatchlistRow).filter(
+            WatchlistRow.user_name == DEFAULT_USER
+        ).order_by(WatchlistRow.added_at.desc()).all()
+        return [
+            {"ticker": r.ticker, "notes": r.notes or "",
+             "added": r.added_at.strftime("%Y-%m-%d") if r.added_at else ""}
+            for r in rows
+        ]
+
+
+def _active_alert_rows():
+    """Return active (non-triggered) alerts for the current user."""
+    with DBSession() as s:
+        rows = s.query(AlertRow).filter(
+            AlertRow.user_name == DEFAULT_USER,
+            AlertRow.is_active == True,         # noqa: E712
+            AlertRow.triggered == False,        # noqa: E712
+        ).order_by(AlertRow.created_at.desc()).all()
+        return [
+            {"id": r.id, "ticker": r.ticker, "alert_type": r.alert_type,
+             "threshold": float(r.threshold), "email": r.email or "—",
+             "created": r.created_at.strftime("%Y-%m-%d") if r.created_at else ""}
+            for r in rows
+        ]
+
+
+def _triggered_alert_rows(days_back: int = 30):
+    """Return alerts triggered in the last `days_back` days."""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=days_back)
+    with DBSession() as s:
+        rows = s.query(AlertRow).filter(
+            AlertRow.user_name == DEFAULT_USER,
+            AlertRow.triggered == True,         # noqa: E712
+            AlertRow.triggered_at >= cutoff,
+        ).order_by(AlertRow.triggered_at.desc()).all()
+        return [
+            {"ticker": r.ticker, "alert_type": r.alert_type,
+             "threshold": float(r.threshold),
+             "triggered_at": r.triggered_at.strftime("%Y-%m-%d %H:%M")
+                             if r.triggered_at else "—"}
+            for r in rows
+        ]
+
+
+def _watchlist_table_component(rows):
+    if not rows:
+        return html.Div(
+            "No tickers in your watchlist yet. Add one above.",
+            style={"color": MUTED, "fontStyle": "italic", "padding": "12px 0"},
+        )
+    return dash_table.DataTable(
+        id="watchlist-dt",
+        columns=[
+            {"name": "Ticker", "id": "ticker"},
+            {"name": "Notes",  "id": "notes"},
+            {"name": "Added",  "id": "added"},
+        ],
+        data=rows,
+        row_deletable=True,
+        style_table={"overflowX": "auto"},
+        style_cell={"fontFamily": FONT_BODY, "fontSize": "13px", "padding": "10px 12px",
+                    "textAlign": "left", "border": f"1px solid {BORDER}"},
+        style_header={"backgroundColor": SURFACE, "fontWeight": "600",
+                      "color": TEXT, "borderBottom": f"2px solid {BORDER}"},
+        style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#FAFAF8"}],
+    )
+
+
+def _alerts_table_component(rows, table_id, deletable=True, include_triggered_col=False):
+    if not rows:
+        return html.Div(
+            "Nothing to show here yet.",
+            style={"color": MUTED, "fontStyle": "italic", "padding": "12px 0"},
+        )
+    columns = [
+        {"name": "Ticker",    "id": "ticker"},
+        {"name": "Type",      "id": "alert_type"},
+        {"name": "Threshold", "id": "threshold", "type": "numeric",
+         "format": {"specifier": ".2f"}},
+    ]
+    if include_triggered_col:
+        columns.append({"name": "Triggered at", "id": "triggered_at"})
+    else:
+        columns += [
+            {"name": "Email",   "id": "email"},
+            {"name": "Created", "id": "created"},
+        ]
+    return dash_table.DataTable(
+        id=table_id,
+        columns=columns,
+        data=rows,
+        row_deletable=deletable,
+        style_table={"overflowX": "auto"},
+        style_cell={"fontFamily": FONT_BODY, "fontSize": "13px", "padding": "10px 12px",
+                    "textAlign": "left", "border": f"1px solid {BORDER}"},
+        style_header={"backgroundColor": SURFACE, "fontWeight": "600",
+                      "color": TEXT, "borderBottom": f"2px solid {BORDER}"},
+        style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#FAFAF8"}],
+    )
+
+
+def layout_watchlist():
+    return html.Div([
+        page_header("Watchlist", "Track tickers you want to keep an eye on"),
+        card([
+            section_header("Add ticker"),
+            html.Div([
+                dcc.Input(
+                    id="wl-ticker", type="text", placeholder="e.g. NVDA",
+                    className="qe-input",
+                    style={"flex": "0 0 160px", "textTransform": "uppercase"},
+                ),
+                dcc.Input(
+                    id="wl-notes", type="text", placeholder="Notes (optional)",
+                    className="qe-input", style={"flex": "1"},
+                ),
+                primary_btn("Add", "wl-add-btn"),
+            ], style={"display": "flex", "gap": "10px", "alignItems": "center"}),
+            html.Div(id="wl-status"),
+        ]),
+        card([
+            section_header("Your watchlist", "Delete a row by clicking the × on the left"),
+            html.Div(id="wl-table-wrap"),
+        ]),
+    ])
+
+
+def layout_alerts():
+    return html.Div([
+        page_header("Alerts", "Get notified when a price crosses your threshold"),
+        card([
+            section_header("Create alert"),
+            html.Div([
+                dcc.Input(
+                    id="al-ticker", type="text", placeholder="Ticker",
+                    className="qe-input",
+                    style={"flex": "0 0 130px", "textTransform": "uppercase"},
+                ),
+                dcc.Dropdown(
+                    id="al-type",
+                    options=[
+                        {"label": "Price above", "value": "price_above"},
+                        {"label": "Price below", "value": "price_below"},
+                        {"label": "Stop loss",   "value": "stop_loss"},
+                    ],
+                    placeholder="Trigger type",
+                    clearable=False,
+                    className="qe-dropdown",
+                    style={"flex": "0 0 170px"},
+                ),
+                dcc.Input(
+                    id="al-threshold", type="number", placeholder="Threshold (price)",
+                    className="qe-input", style={"flex": "0 0 150px"},
+                ),
+                dcc.Input(
+                    id="al-email", type="email", placeholder="Email (optional)",
+                    className="qe-input", style={"flex": "1"},
+                ),
+                primary_btn("Create", "al-create-btn"),
+            ], style={"display": "flex", "gap": "10px", "alignItems": "center",
+                      "flexWrap": "wrap"}),
+            html.Div(id="al-status"),
+        ]),
+        card([
+            section_header(
+                "Active alerts",
+                "Auto-checked every 15 min by the scheduler. Delete with the ×.",
+            ),
+            html.Div(id="al-active-wrap"),
+        ]),
+        card([
+            section_header("Recently triggered", "Last 30 days"),
+            html.Div(id="al-triggered-wrap"),
+        ]),
+    ])
+
+
+# ── Watchlist callbacks ──────────────────────────────────────────────
+
+@app.callback(
+    Output("wl-table-wrap", "children"),
+    Output("wl-status",     "children"),
+    Output("wl-ticker",     "value"),
+    Output("wl-notes",      "value"),
+    Input("wl-add-btn", "n_clicks"),
+    State("wl-ticker",  "value"),
+    State("wl-notes",   "value"),
+    prevent_initial_call=False,
+)
+def watchlist_add(n_clicks, ticker, notes):
+    status = None
+    if n_clicks and ticker:
+        ticker_norm = ticker.strip().upper()
+        if ticker_norm:
+            try:
+                with DBSession() as s:
+                    existing = s.query(WatchlistRow).filter_by(
+                        user_name=DEFAULT_USER, ticker=ticker_norm,
+                    ).first()
+                    if existing:
+                        status = html.Div(
+                            f"{ticker_norm} is already on your watchlist.",
+                            className="qe-toast error",
+                        )
+                    else:
+                        s.add(WatchlistRow(
+                            user_name=DEFAULT_USER, ticker=ticker_norm,
+                            notes=(notes or "").strip() or None,
+                        ))
+                        s.commit()
+                        status = html.Div(
+                            f"Added {ticker_norm} to your watchlist.",
+                            className="qe-toast success",
+                        )
+            except Exception as e:
+                logger.exception("Watchlist add failed: %s", e)
+                status = html.Div(f"Failed to add: {e}", className="qe-toast error")
+    return _watchlist_table_component(_watchlist_rows()), status, "", ""
+
+
+@app.callback(
+    Output("wl-table-wrap", "children", allow_duplicate=True),
+    Input("watchlist-dt", "data"),
+    State("watchlist-dt", "data_previous"),
+    prevent_initial_call=True,
+)
+def watchlist_handle_delete(current, previous):
+    if previous is None:
+        return dash.no_update
+    current_tickers  = {r["ticker"] for r in (current or [])}
+    previous_tickers = {r["ticker"] for r in (previous or [])}
+    removed = previous_tickers - current_tickers
+    if not removed:
+        return dash.no_update
+    try:
+        with DBSession() as s:
+            for t in removed:
+                s.query(WatchlistRow).filter_by(
+                    user_name=DEFAULT_USER, ticker=t,
+                ).delete()
+            s.commit()
+    except Exception as e:
+        logger.exception("Watchlist delete failed: %s", e)
+    return _watchlist_table_component(_watchlist_rows())
+
+
+# ── Alerts callbacks ──────────────────────────────────────────────
+
+@app.callback(
+    Output("al-active-wrap",    "children"),
+    Output("al-triggered-wrap", "children"),
+    Output("al-status",         "children"),
+    Output("al-ticker",         "value"),
+    Output("al-type",           "value"),
+    Output("al-threshold",      "value"),
+    Output("al-email",          "value"),
+    Input("al-create-btn", "n_clicks"),
+    State("al-ticker",    "value"),
+    State("al-type",      "value"),
+    State("al-threshold", "value"),
+    State("al-email",     "value"),
+    prevent_initial_call=False,
+)
+def alerts_create(n_clicks, ticker, alert_type, threshold, email):
+    status = None
+    if n_clicks:
+        if not ticker or not alert_type or threshold is None:
+            status = html.Div(
+                "Ticker, type and threshold are required.",
+                className="qe-toast error",
+            )
+        else:
+            try:
+                with DBSession() as s:
+                    s.add(AlertRow(
+                        user_name=DEFAULT_USER,
+                        ticker=ticker.strip().upper(),
+                        alert_type=alert_type,
+                        threshold=float(threshold),
+                        email=(email or "").strip() or None,
+                        is_active=True,
+                        triggered=False,
+                    ))
+                    s.commit()
+                status = html.Div(
+                    f"Created {alert_type} alert for "
+                    f"{ticker.strip().upper()} at {threshold:.2f}.",
+                    className="qe-toast success",
+                )
+            except Exception as e:
+                logger.exception("Alert create failed: %s", e)
+                status = html.Div(f"Failed to create: {e}", className="qe-toast error")
+    active = _alerts_table_component(_active_alert_rows(), "al-active-dt", deletable=True)
+    triggered = _alerts_table_component(
+        _triggered_alert_rows(), "al-triggered-dt",
+        deletable=False, include_triggered_col=True,
+    )
+    return active, triggered, status, "", None, None, ""
+
+
+@app.callback(
+    Output("al-active-wrap", "children", allow_duplicate=True),
+    Input("al-active-dt", "data"),
+    State("al-active-dt", "data_previous"),
+    prevent_initial_call=True,
+)
+def alerts_handle_delete(current, previous):
+    if previous is None:
+        return dash.no_update
+    current_ids  = {r["id"] for r in (current or [])}
+    previous_ids = {r["id"] for r in (previous or [])}
+    removed = previous_ids - current_ids
+    if not removed:
+        return dash.no_update
+    try:
+        with DBSession() as s:
+            for alert_id in removed:
+                s.query(AlertRow).filter_by(id=alert_id).delete()
+            s.commit()
+    except Exception as e:
+        logger.exception("Alert delete failed: %s", e)
+    return _alerts_table_component(_active_alert_rows(), "al-active-dt", deletable=True)
+
+
+# ════════════════════════════════════════════════════════════════════
 #  APP LAYOUT
 # ════════════════════════════════════════════════════════════════════
 app.layout = html.Div([
@@ -1043,21 +1446,21 @@ app.layout = html.Div([
     Output("active-tab",    "data"),
     Output("nav-portfolio", "className"),
     Output("nav-screener",  "className"),
-    Output("nav-strategy",  "className"),
+    Output("nav-watchlist", "className"),
+    Output("nav-alerts",    "className"),
     Input("nav-portfolio",  "n_clicks"),
     Input("nav-screener",   "n_clicks"),
-    Input("nav-strategy",   "n_clicks"),
+    Input("nav-watchlist",  "n_clicks"),
+    Input("nav-alerts",     "n_clicks"),
     prevent_initial_call=True,
 )
-def update_nav(_p, _s, _st):
+def update_nav(_p, _s, _w, _a):
     ctx = callback_context
     if not ctx.triggered:
-        return "portfolio", "nav-item active", "nav-item", "nav-item"
+        return "portfolio", "nav-item active", "nav-item", "nav-item", "nav-item"
     tab = ctx.triggered[0]["prop_id"].split(".")[0].replace("nav-", "")
-    return (tab,
-            "nav-item active" if tab == "portfolio" else "nav-item",
-            "nav-item active" if tab == "screener"  else "nav-item",
-            "nav-item active" if tab == "strategy"  else "nav-item")
+    def _cls(t): return "nav-item active" if tab == t else "nav-item"
+    return tab, _cls("portfolio"), _cls("screener"), _cls("watchlist"), _cls("alerts")
 
 
 @app.callback(Output("page-content", "children"), Input("active-tab", "data"))
@@ -1065,7 +1468,8 @@ def render_page(tab):
     tab = tab or "portfolio"
     if tab == "portfolio": return layout_portfolio()
     if tab == "screener":  return layout_screener()
-    if tab == "strategy":  return layout_strategy()
+    if tab == "watchlist": return layout_watchlist()
+    if tab == "alerts":    return layout_alerts()
     return layout_portfolio()
 
 
@@ -1077,7 +1481,7 @@ def render_page(tab):
 def update_portfolio_header(tab):
     if tab != "portfolio":
         return dash.no_update, dash.no_update
-    data     = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data     = load_all_data("transactions.csv")
     prices_p = data["prices_port"] if data["prices_port"] is not None else pd.DataFrame()
     open_df, _ = compute_holdings_table(data["transactions"], prices_p,
                                        data["df_tech"], data["df_fund"], data["stocks_df"],
@@ -1188,7 +1592,7 @@ def _make_holdings_datatable(df, table_id, pct_col="_unreal_pct"):
 def update_holdings(tab):
     if tab != "portfolio":
         return dash.no_update, dash.no_update, dash.no_update, [], None, [], None
-    data     = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data     = load_all_data("transactions.csv")
     prices_p = data["prices_port"] if data["prices_port"] is not None else pd.DataFrame()
     open_df, closed_df = compute_holdings_table(
         data["transactions"], prices_p,
@@ -1223,7 +1627,7 @@ def update_holdings(tab):
 def update_spy_chart(ticker):
     if not ticker:
         return go.Figure().update_layout(**PLOTLY_THEME)
-    data  = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data  = load_all_data("transactions.csv")
     tx_t  = data["transactions"]
     tx_t  = tx_t[(tx_t["ticker"] == ticker) & (tx_t["type"] == "buy")]
     first = pd.to_datetime(tx_t["date"].min()) if not tx_t.empty else None
@@ -1234,7 +1638,7 @@ def update_spy_chart(ticker):
 def update_stop_table(tab):
     if tab != "portfolio":
         return dash.no_update
-    data  = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data  = load_all_data("transactions.csv")
     stops = data["stops"]
     if stops is None or stops.empty:
         return html.P("No stop data.", style={"color": MUTED, "fontFamily": FONT_UI})
@@ -1250,7 +1654,7 @@ def update_stop_table(tab):
 def update_candle(ticker):
     if not ticker:
         return go.Figure().update_layout(**PLOTLY_THEME)
-    data   = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data   = load_all_data("transactions.csv")
     prices = data["prices_port"]
     stops  = data["stops"]
     df_t   = prices[prices["ticker"] == ticker] if prices is not None else pd.DataFrame()
@@ -1268,7 +1672,7 @@ def update_candle(ticker):
 def populate_sectors(tab):
     if tab != "screener":
         return []
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     sdf     = data["stocks_df"]
     if "Sector" not in sdf.columns:
         return []
@@ -1300,7 +1704,7 @@ def clear_filters(_):
     prevent_initial_call=False,
 )
 def update_screener(n, metric, min_tech, sectors, topn):
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     ft      = data["factor_table"].copy()
     sdf     = data["stocks_df"].copy()
     topn    = int(topn or 50)
@@ -1558,9 +1962,9 @@ def update_screener(n, metric, min_tech, sectors, topn):
             "Mkt Cap":           "Market cap = shares x price. T=trillion, B=billion.",
             "YTD %":             "Year-to-date return: (price_today / price_jan1) - 1.",
             "technical_score":   "Composite 0-1. Signals: momentum 12M (+30%), return 20d (+20%), trend vs EMA200 (+15%), MACD (+10%), minus volatility 60d (-20%) and drawdown 12M (-15%). Z-scored per date.",
-            "ML Score":          "LightGBM ranking model (0-1). Trained on 10 technical features. Predicts 3-month relative rank.",
-            "ML Band":           "80% confidence band [q10 — q90]. Wide band = high uncertainty on this stock.",
-            "ML Decile":         "Decile ranking 1-10. Decile 10 = top 10% predicted. Decile 1 = bottom 10%.",
+            "ML Score":          "LightGBM ranking model (0-1). Trained on 10 technical features. Predicts 3-month relative rank — re-evaluate monthly, scores drift as new data arrives.",
+            "ML Band":           "80% confidence band [q10 — q90]. Wide band = high uncertainty on this stock; treat the score as noisy.",
+            "ML Decile":         "Decile ranking 1-10. Decile 10 = top 10% predicted performers. Decile 1 = bottom 10%.",
             "fundamental_score": "Quality 0-1. ROIC 25% + FCF margin 20% + Rev CAGR 20% + Gross margin 20% + Interest coverage 15%. NaN-safe weighted avg.",
             "DCF Upside":        "(DCF_value - price) / price. Positive = undervalued. FMP /discounted-cash-flow.",
             "ROIC":              "Return on Invested Capital: EBIT*(1-tax) / (equity+net_debt). >15% = competitive moat. Better than ROE.",
@@ -1581,9 +1985,20 @@ def update_screener(n, metric, min_tech, sectors, topn):
     )
 
     # ── 5. Regime banner ─────────────────────────────────────────────
+    # Render the current market regime detected by modules.regime_detector.
+    # Defaults are unified so a partial regime dict still produces a
+    # coherent banner instead of mixing "0%" with "?" placeholders.
     regime = data.get("regime")
     if regime:
         regime_color = regime.get("color", ACCENT)
+        stay_prob = regime.get("stay_probability")
+        stay_prob_str = f"{stay_prob:.0%}" if isinstance(stay_prob, (int, float)) else "N/A"
+        expected_dur = regime.get("expected_duration_days")
+        expected_dur_str = (
+            f"~{expected_dur} trading days"
+            if isinstance(expected_dur, (int, float))
+            else "N/A"
+        )
         banner = html.Div([
             html.Div([
                 html.Span(regime.get("stars", ""), style={
@@ -1599,13 +2014,13 @@ def update_screener(n, metric, min_tech, sectors, topn):
                 }),
             ], style={"display": "flex", "alignItems": "center"}),
             html.Div([
-                html.Span(f"Prob. manter regime: {regime.get('stay_probability', 0):.0%}", style={
+                html.Span(f"P(stay in regime): {stay_prob_str}", style={
                     "fontFamily": FONT_BODY, "fontSize": "11px", "color": MUTED,
                 }),
-                html.Span(f"  ·  Duração esperada: ~{regime.get('expected_duration_days', '?')} dias úteis", style={
+                html.Span(f"  ·  Expected duration: {expected_dur_str}", style={
                     "fontFamily": FONT_BODY, "fontSize": "11px", "color": MUTED,
                 }),
-                html.Span(f"  ·  Actualizado: {regime.get('date', 'N/A')}", style={
+                html.Span(f"  ·  Updated: {regime.get('date', 'N/A')}", style={
                     "fontFamily": FONT_BODY, "fontSize": "11px", "color": MUTED,
                 }),
             ], style={"marginTop": "6px"}),
@@ -1615,10 +2030,15 @@ def update_screener(n, metric, min_tech, sectors, topn):
             "borderRadius": "8px", "padding": "14px 20px",
         })
     else:
+        # Regime detection returned None — most likely missing SPY history
+        # or insufficient observations. See logs from modules.regime_detector
+        # for the exact reason.
         banner = html.Div([
             html.Span("Regime: ", style={"fontFamily": FONT_UI, "color": MUTED}),
-            html.Span("Não calculado — corre ", style={"fontFamily": FONT_UI, "color": MUTED, "fontSize": "12px"}),
-            html.Code("python modules/regime_detector.py", style={"fontSize": "11px"}),
+            html.Span(
+                "Not available — see logs for diagnostic details.",
+                style={"fontFamily": FONT_UI, "color": MUTED, "fontSize": "12px"},
+            ),
         ], style={
             "background": SURFACE, "borderRadius": "8px",
             "padding": "12px 18px", "border": f"1px solid {BORDER}",
@@ -1653,7 +2073,7 @@ def show_weights(mom, ret, trend, macd, vol, dd):
     prevent_initial_call=True,
 )
 def run_bt(n, start, budget, topn, rebal, w_mom, w_ret, w_trend, w_macd, w_vol, w_dd):
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     weights = {"mom_12m_z": w_mom or 0.30, "ret_6m_z": w_ret or 0.20,
                "trend_z": w_trend or 0.15, "macd_z": w_macd or 0.10,
                "vol_60d_z": w_vol or -0.20, "dd_12m_z": w_dd or -0.15}
@@ -1702,7 +2122,7 @@ def run_bt(n, start, budget, topn, rebal, w_mom, w_ret, w_trend, w_macd, w_vol, 
     prevent_initial_call=True,
 )
 def run_optimiser(n, start, budget, topn):
-    data    = load_all_data("transactions.csv", "stocks_all_pages.csv")
+    data    = load_all_data("transactions.csv")
     results = optimise_weights(df_tech=data["df_tech"], prices=data["prices"],
                                start_date=start or "2015-01-01",
                                monthly_budget=float(budget or 1000),
