@@ -24,8 +24,8 @@ gunicorn>=21.0.0
 # ── Misc: still used for stock split data only ────────────────────────────────
 yfinance>=0.2.40
 
-# ── Optional: load .env files automatically ───────────────────────────────────
-# python-dotenv>=1.0.0
+# ── Environment loader (reads .env for local dev; Railway/Heroku use real env vars) ──
+python-dotenv>=1.0.0
 
 # ── ML models ─────────────────────────────────────────────────────────────────
 lightgbm>=4.0.0
