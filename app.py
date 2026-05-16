@@ -828,6 +828,14 @@ app = dash.Dash(
     title="QuantEdge",
 )
 
+# WSGI entry point for gunicorn. The Procfile / Dockerfile start the
+# app as `gunicorn ... app:server`, so the Flask server underneath
+# Dash must be exposed at module level. Without this, gunicorn aborts
+# with "Failed to find attribute 'server' in 'app'". `python app.py`
+# (which calls app.run further down) never needed it, which is why
+# this only surfaced on the first real gunicorn deployment.
+server = app.server
+
 
 # ════════════════════════════════════════════════════════════════════
 #  SIDEBAR
