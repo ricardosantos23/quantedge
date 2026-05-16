@@ -26,6 +26,7 @@ queries are issued — only ``ticker.splits``.
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 import pandas as pd
@@ -43,9 +44,32 @@ _splits_cache: dict = {}
 #  TRANSACTIONS
 # ════════════════════════════════════════════════════════════════════
 
+#: Schema every caller downstream expects. An empty frame with these
+#: columns flows through build_positions / compute_pnl /
+#: compute_holdings_table without crashing — they already short-circuit
+#: on empty input.
+_TX_COLUMNS = ["user", "ticker", "date", "quantity", "price", "currency", "type"]
+
+
 def load_transactions(path: str) -> pd.DataFrame:
+    """Load the user's trade history.
+
+    ``transactions.csv`` holds personal trades and is deliberately
+    git-ignored (the repo is public), so it is absent on fresh clones
+    and on the deployed container. Treat a missing file as "no
+    portfolio yet" — the Screener, Watchlist, and Alerts tabs are
+    fully usable without it, and the Portfolio tab renders an empty
+    state instead of crashing the whole app.
+    """
+    if not os.path.exists(path):
+        logger.warning(
+            "%s not found — running with an empty portfolio "
+            "(Screener / Watchlist / Alerts unaffected)", path,
+        )
+        return pd.DataFrame(columns=_TX_COLUMNS)
+
     df = pd.read_csv(path, parse_dates=["date"])
-    for col in ["user", "ticker", "date", "quantity", "price", "currency", "type"]:
+    for col in _TX_COLUMNS:
         if col not in df.columns:
             raise ValueError(f"transactions.csv is missing column: {col}")
     df["ticker"]   = df["ticker"].str.upper()
