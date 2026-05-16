@@ -91,7 +91,12 @@ def get_fx_data(currencies: list[str], start_date) -> dict:
     We invert: 1/1.08 = 0.926 EUR per USD.
     This matches the original yfinance behaviour exactly.
     """
-    start_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+    # No foreign currencies, or no usable start date (NaT when the
+    # transaction history is empty) → there is no FX to fetch.
+    ts = pd.Timestamp(start_date)
+    if not currencies or pd.isna(ts):
+        return {}
+    start_str = ts.strftime("%Y-%m-%d")
     fx_data: dict = {}
 
     with Session() as s:
@@ -506,8 +511,16 @@ def compute_portfolio_kpis(pnl_df, holdings_df, transactions, fx_data=None) -> d
 
 
 def build_portfolio_analytics(transactions_path: str, prices: pd.DataFrame) -> pd.DataFrame:
-    """Drop-in replacement for original build_portfolio_analytics()."""
-    tx         = load_transactions(transactions_path)
+    """Compute the daily portfolio P&L series.
+
+    Returns an empty DataFrame when there are no transactions (e.g. the
+    git-ignored transactions.csv is absent on the deployed container).
+    Without this guard, ``tx["date"].min()`` is NaT and the downstream
+    get_fx_data() crashed with "NaTType does not support strftime".
+    """
+    tx = load_transactions(transactions_path)
+    if tx.empty:
+        return pd.DataFrame()
     currencies = [c for c in tx["currency"].unique() if c != "EUR"]
     fx_data    = get_fx_data(currencies, tx["date"].min())
     positions  = build_positions(tx, prices, fx_data)
