@@ -84,3 +84,9 @@ logs/
 *.bak
 *.tmp
 *.old
+
+# ---- Scratch / throwaway scripts and dumps (underscore-prefixed) ----
+_*.py
+_*.txt
+_pdf_pages/
+_preview_mockup/

@@ -108,32 +108,35 @@ else:
 # ── 5. Price history ──────────────────────────────────────────────
 print("\n[5/7] Ingesting price history...")
 
-from ingestion.universe import get_universe_df
-stocks_df = get_universe_df(active_only=True, stocks_only=False, with_sector=False)
-
 # ── Determine screener ticker list ────────────────────────────────
+# Sourced from the FMP company-screener endpoint, which returns
+# tickers already ranked by market cap WITH sector/market_cap in the
+# same payload. This fixes the previous chicken-and-egg bug: ranking
+# the universe by market cap used to require market caps that were
+# never fetched (company_info.market_cap was NULL for ~all rows on a
+# fresh DB), so "top 500" silently collapsed to just the portfolio.
+from datetime import datetime as _dt
+
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from db.connection import Session
+from db.models import CompanyInfo
+from ingestion.fmp_client import fetch_screener_universe
+
+screener_universe = None  # list[dict] when sourced from the FMP screener
+
 if isinstance(config.SCREENER_UNIVERSE, str) and config.SCREENER_UNIVERSE.lower() == "all":
+    screener_universe = fetch_screener_universe(min_market_cap=MIN_MARKET_CAP_FILTER)
+    top_n = [d["ticker"] for d in screener_universe]
     if MIN_MARKET_CAP_FILTER > 0:
-        filtered = (
-            stocks_df
-            .dropna(subset=["Market Cap"])
-            .query("`Market Cap` >= @MIN_MARKET_CAP_FILTER")
-        )
-        top_n  = filtered["Symbol"].tolist()
-        label  = (f"all stocks with market cap >= "
-                  f"${MIN_MARKET_CAP_FILTER/1e9:.1f}B ({len(top_n)} tickers)")
+        label = (f"all stocks with market cap >= "
+                 f"${MIN_MARKET_CAP_FILTER/1e9:.1f}B ({len(top_n)} tickers)")
     else:
-        top_n  = stocks_df["Symbol"].dropna().tolist()
-        label  = f"ALL {len(top_n)} tickers (no market cap filter)"
+        label = f"ALL {len(top_n)} investable tickers"
 
 elif isinstance(config.SCREENER_UNIVERSE, int):
-    top_n = (
-        stocks_df
-        .dropna(subset=["Market Cap"])
-        .sort_values("Market Cap", ascending=False)
-        .head(config.SCREENER_UNIVERSE)["Symbol"]
-        .tolist()
-    )
+    screener_universe = fetch_screener_universe(limit=config.SCREENER_UNIVERSE)
+    top_n = [d["ticker"] for d in screener_universe]
     label = f"top {config.SCREENER_UNIVERSE} by market cap"
 
 elif isinstance(config.SCREENER_UNIVERSE, list):
@@ -141,8 +144,31 @@ elif isinstance(config.SCREENER_UNIVERSE, list):
     label = f"custom list of {len(top_n)} tickers"
 
 else:
-    top_n  = stocks_df["Symbol"].dropna().tolist()
-    label  = f"all {len(top_n)} tickers (fallback)"
+    screener_universe = fetch_screener_universe(limit=500)
+    top_n = [d["ticker"] for d in screener_universe]
+    label = "top 500 by market cap (fallback)"
+
+# Persist the screener universe into company_info WITH market_cap and
+# sector up front, so the app can rank/filter the screener immediately
+# instead of waiting on a separate enrichment pass.
+if screener_universe:
+    with Session() as s:
+        stmt = pg_insert(CompanyInfo).values(screener_universe)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["ticker"],
+            set_={
+                "company_name": stmt.excluded.company_name,
+                "sector":       stmt.excluded.sector,
+                "industry":     stmt.excluded.industry,
+                "market_cap":   stmt.excluded.market_cap,
+                "exchange":     stmt.excluded.exchange,
+                "country":      stmt.excluded.country,
+                "updated_at":   _dt.utcnow(),
+            },
+        )
+        s.execute(stmt)
+        s.commit()
+    print(f"  ✓ {len(screener_universe)} companies enriched (market cap, sector)")
 
 # Always include portfolio tickers and SPY
 tickers_to_ingest = list(set(top_n) | set(portfolio_tickers) | {"SPY"})

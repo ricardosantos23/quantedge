@@ -232,6 +232,96 @@ def fetch_stock_list() -> list:
     return rows
 
 
+def fetch_screener_universe(
+    limit: int | None = None,
+    min_market_cap: float = 0,
+    page_size: int = 1000,
+) -> list[dict]:
+    """Fetch the investable universe pre-ranked by market cap.
+
+    Uses the FMP ``/stable/company-screener`` endpoint, which returns
+    actively-traded companies already sorted by market cap descending
+    and — crucially — with ``marketCap`` and ``sector`` populated in
+    the same response. This avoids the chicken-and-egg problem in
+    setup.py where ranking by market cap required market caps that had
+    not been fetched yet.
+
+    Pagination is done with a market-cap cursor: each page filters
+    ``marketCapLowerThan`` to just below the smallest cap of the
+    previous page. FMP's screener has no offset/page parameter.
+
+    Args:
+        limit: Stop after this many companies (e.g. 500 for "top 500").
+            ``None`` means "every company above ``min_market_cap``".
+        min_market_cap: Exclude companies below this market cap (USD).
+            Use e.g. 1_000_000_000 to skip illiquid micro-caps.
+        page_size: Rows requested per screener call (FMP caps the
+            screener response; 1000 is a safe page size).
+
+    Returns:
+        A list of dicts shaped for the ``company_info`` upsert:
+        ``ticker, company_name, sector, industry, market_cap,
+        exchange, country, is_etf, is_actively_trading``. Ordered by
+        market cap descending.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    cursor: float | None = None
+
+    while True:
+        # FMP's screener only returns results sorted by market cap
+        # DESC when a marketCapMoreThan filter is present. Without it,
+        # the order is arbitrary and rows with null market cap surface
+        # first. Always send a floor (>= 1) so the ranking is reliable.
+        params: dict = {
+            "isActivelyTrading": "true",
+            "limit": page_size,
+            "marketCapMoreThan": int(max(min_market_cap, 1)),
+        }
+        if cursor is not None:
+            # Next page: strictly smaller caps than the last row seen.
+            params["marketCapLowerThan"] = int(cursor)
+
+        data = get("company-screener", params)
+        if not data or not isinstance(data, list):
+            break
+
+        page_min_cap = None
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            ticker = str(item.get("symbol") or "").upper().strip()
+            if not ticker or ticker in seen:
+                continue
+            mc = item.get("marketCap")
+            seen.add(ticker)
+            out.append({
+                "ticker":              ticker,
+                "company_name":        str(item.get("companyName") or ""),
+                "sector":              str(item.get("sector") or ""),
+                "industry":            str(item.get("industry") or ""),
+                "market_cap":          int(mc) if mc else None,
+                "exchange":            str(item.get("exchange")
+                                           or item.get("exchangeShortName") or ""),
+                "country":             str(item.get("country") or ""),
+                "is_etf":              bool(item.get("isEtf")),
+                "is_actively_trading": True,
+            })
+            if mc is not None:
+                page_min_cap = mc if page_min_cap is None else min(page_min_cap, mc)
+
+            if limit is not None and len(out) >= limit:
+                return out[:limit]
+
+        # Stop when the page came back short (no more data) or we can't
+        # advance the cursor.
+        if len(data) < page_size or page_min_cap is None or page_min_cap == cursor:
+            break
+        cursor = page_min_cap
+
+    return out
+
+
 def fetch_company_profiles(tickers: list, batch_size: int = 1) -> list:
     """Enrich tickers with sector/market cap via /stable/profile."""
     results = []
