@@ -496,6 +496,9 @@ def compute_holdings_table(transactions, prices, df_tech, df_fund, stocks_df, fx
     tx        = transactions.copy()
     tx["date"] = pd.to_datetime(tx["date"])
     price_col  = "adj_close" if "adj_close" in prices.columns else "close"
+    # The `prices` table stores quotes in USD for these US-listed
+    # tickers, so every current market price needs the same EURUSD
+    # conversion to land on the EUR basis used by avg_entry and KPIs.
     usd_rate   = _fx_latest(fx_data, "USD")
 
     open_rows   = []
@@ -566,7 +569,11 @@ def compute_holdings_table(transactions, prices, df_tech, df_fund, stocks_df, fx
             tp        = prices[prices["ticker"] == ticker].sort_values("date")
             current_px     = float(tp[price_col].iloc[-1]) if not tp.empty else np.nan
             current_px_eur = current_px * usd_rate if not np.isnan(current_px) else np.nan
-            pos_val        = current_px * qty if not np.isnan(current_px) else 0.0
+            # _pos_val drives Wallet and Weight % (and the allocation
+            # pies / KPI total return). It MUST be the EUR-converted
+            # market value, not the raw USD price, so it shares a basis
+            # with the EUR avg_entry and the EUR `invested` in KPIs.
+            pos_val        = current_px_eur * qty if not np.isnan(current_px_eur) else 0.0
             unreal_val     = (current_px_eur - avg_entry) * qty if not np.isnan(current_px_eur) else np.nan
             unreal_pct     = (current_px_eur / avg_entry - 1.0) * 100 \
                              if avg_entry > 0 and not np.isnan(current_px_eur) else np.nan
@@ -642,13 +649,22 @@ def compute_portfolio_kpis(pnl_df, holdings_df, transactions, fx_data=None):
 
     tx = transactions.copy()
     tx["date"] = pd.to_datetime(tx["date"])
-    # Use raw transaction prices — same basis as _pos_val (raw current_px)
-    # so total_return_pct and CAGR remain internally consistent
+    # `wallet` is the EUR market value (sum of _pos_val). Net invested
+    # capital must be on the SAME EUR basis or total_return_pct / CAGR
+    # mix currencies and distort by the EURUSD rate (~8-15%). EUR-
+    # currency rows already hold the EUR price the user paid, so
+    # _fx_rate() returns 1.0 and leaves them untouched; the lone USD-
+    # currency row is converted at its trade-date EURUSD rate — exactly
+    # the per-row convention compute_holdings_table uses for cost basis.
+    tx["price_eur"] = tx.apply(
+        lambda r: r["price"] * _fx_rate(fx_data, r["currency"], r["date"]),
+        axis=1,
+    )
     buys  = tx[tx["type"] == "buy"]
     sells = tx[tx["type"] == "sell"]
     invested = max(
-        float((buys["quantity"]  * buys["price"]).sum()) -
-        float((sells["quantity"] * sells["price"]).sum()),
+        float((buys["quantity"]  * buys["price_eur"]).sum()) -
+        float((sells["quantity"] * sells["price_eur"]).sum()),
         1.0
     )
 
@@ -801,8 +817,17 @@ def _load_all_data_locked(transactions_path, years_back):
     stops = compute_stop_recommendations(prices_port, tx) \
             if prices_port is not None else pd.DataFrame()
 
-    currencies = [c for c in tx["currency"].unique() if c != "EUR"]
-    fx_data    = get_fx_data(currencies, tx["date"].min()) if currencies else {}
+    # EURUSD is always required: the `prices` table is USD-denominated
+    # for these US-listed tickers, so compute_holdings_table must
+    # convert market value to EUR even when NO transaction was booked
+    # in USD. Fetching FX only for non-EUR *transaction* currencies left
+    # an all-EUR history with fx_data={}, _fx_latest("USD")→1.0, and the
+    # USD→EUR step silently skipped (Wallet/return inflated ~16%). Force
+    # "USD" in addition to any non-EUR transaction currencies.
+    tx_currencies = [c for c in tx["currency"].unique() if c != "EUR"]
+    fx_currencies = sorted(set(tx_currencies) | {"USD"})
+    # get_fx_data() safely returns {} when tx is empty (min date = NaT).
+    fx_data       = get_fx_data(fx_currencies, tx["date"].min())
 
     # ── ML Scores + Regime (usa dados já carregados) ─────────────
     ml_scores = compute_ml_scores(prices_all)
