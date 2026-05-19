@@ -44,11 +44,16 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import text as sql_text
 
 from db.connection import Session, engine
 from db.models import Transaction
 
 logger = logging.getLogger(__name__)
+
+#: Application-wide constant for pg_advisory_xact_lock — serialises the
+#: first-boot seed across concurrent gunicorn workers (see seed_if_empty).
+_SEED_LOCK_KEY = 0x51454447  # ascii "QEDG"
 
 #: Canonical DataFrame schema every downstream consumer expects. Kept
 #: identical to ``analytics.portfolio._TX_COLUMNS`` (the legacy CSV
@@ -78,7 +83,14 @@ def _ensure_table() -> None:
     global _table_ready
     if _table_ready:
         return
-    Transaction.__table__.create(bind=engine, checkfirst=True)
+    try:
+        Transaction.__table__.create(bind=engine, checkfirst=True)
+    except Exception:
+        # Concurrent workers can race the CREATE; the table simply
+        # existing is the desired end state, so a duplicate-create
+        # error here is benign.
+        logger.debug("[transactions] table-create race ignored",
+                      exc_info=True)
     _table_ready = True
 
 
@@ -185,13 +197,13 @@ def load_transactions_df() -> pd.DataFrame:
     return df
 
 
-def replace_all(df: pd.DataFrame) -> int:
-    """Atomically replace the whole table with ``df`` (already parsed).
+def _write_all(session, df: pd.DataFrame) -> int:
+    """Replace every row using an existing session (no commit here).
 
-    Used by the one-shot seed and by the ``sync`` maintenance command.
-    Returns the number of rows written.
+    The caller's :class:`Session` context manager owns the
+    commit/rollback, which keeps the delete+insert atomic and lets the
+    seed path hold an advisory lock across the whole operation.
     """
-    _ensure_table()
     records = [
         Transaction(
             user_name = str(r["user"]).strip() or "default",
@@ -204,12 +216,22 @@ def replace_all(df: pd.DataFrame) -> int:
         )
         for _, r in df.iterrows()
     ]
-    with Session() as s:
-        s.query(Transaction).delete()
-        s.add_all(records)
-    logger.info("[transactions] wrote %d rows to the transactions table",
-                len(records))
+    session.query(Transaction).delete()
+    session.add_all(records)
     return len(records)
+
+
+def replace_all(df: pd.DataFrame) -> int:
+    """Atomically replace the whole table with ``df`` (already parsed).
+
+    Used by the ``sync`` maintenance command. Returns the number of
+    rows written.
+    """
+    _ensure_table()
+    with Session() as s:
+        n = _write_all(s, df)
+    logger.info("[transactions] wrote %d rows to the transactions table", n)
+    return n
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -250,6 +272,8 @@ def seed_if_empty(csv_path: str | None = "transactions.csv") -> int:
     call on every startup / page load. Returns the number of rows
     seeded (0 if the table was already populated or no source exists).
     """
+    # Cheap pre-check avoids taking the lock on the common (already
+    # seeded) path — i.e. every page load after the first boot.
     if count_transactions() > 0:
         return 0
     try:
@@ -265,14 +289,27 @@ def seed_if_empty(csv_path: str | None = "transactions.csv") -> int:
             ENV_VAR,
         )
         return 0
-    label, text = seed
+    label, csv = seed
     try:
-        df = parse_csv_text(text)
+        df = parse_csv_text(csv)
     except ValueError as exc:
         logger.error("[transactions] seed source %s is invalid: %s",
                      label, exc)
         return 0
-    n = replace_all(df)
+
+    _ensure_table()
+    with Session() as s:
+        # Serialise concurrent gunicorn workers: only the first to grab
+        # this transaction-scoped advisory lock seeds; the lock releases
+        # automatically on commit. The others then see a non-empty table
+        # via the double-check below and no-op (no double-counting).
+        s.execute(sql_text("SELECT pg_advisory_xact_lock(:k)"),
+                  {"k": _SEED_LOCK_KEY})
+        if s.query(Transaction).count() > 0:
+            logger.info("[transactions] another worker already seeded — "
+                        "skipping")
+            return 0
+        n = _write_all(s, df)
     logger.info("[transactions] auto-seeded %d trades from %s", n, label)
     return n
 
