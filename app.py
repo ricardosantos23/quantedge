@@ -734,8 +734,21 @@ def _load_all_data_locked(transactions_path, years_back):
         tickers_screen = all_tickers
         label = "all"
     elif isinstance(SCREENER_UNIVERSE, int):
-        tickers_screen = all_tickers[:SCREENER_UNIVERSE]
-        label = f"first {SCREENER_UNIVERSE}"
+        # Rank by market cap and take the top N, mirroring how setup.py
+        # (via fetch_screener_universe) chooses which tickers to ingest.
+        # Only the screener universe has market_cap populated in
+        # company_info, so this selects exactly the tickers that have
+        # price/fundamental data — instead of an arbitrary first-N slice
+        # that left ~20% of the screener blank.
+        ranked = (
+            stocks_df.dropna(subset=["Market Cap"])
+            .sort_values("Market Cap", ascending=False)
+        )
+        tickers_screen = (
+            ranked["Symbol"].dropna().astype(str).str.upper()
+            .head(SCREENER_UNIVERSE).tolist()
+        )
+        label = f"top {SCREENER_UNIVERSE} by market cap"
     elif isinstance(SCREENER_UNIVERSE, list):
         tickers_screen = [t.upper() for t in SCREENER_UNIVERSE]
         label = f"custom list ({len(tickers_screen)})"
