@@ -7,6 +7,7 @@ prices            — daily OHLCV (replaces yfinance on-the-fly calls)
 fx_rates          — daily EUR → X exchange rates (replaces yfinance FX)
 company_info      — ticker metadata (replaces stocks_all_pages.csv)
 fundamentals      — cached FMP fundamental scores + raw metrics
+transactions      — user trade history (replaces git-ignored transactions.csv)
 watchlist         — user watchlist entries
 alerts            — price / stop-loss alert rules
 earnings_calendar — upcoming earnings events
@@ -126,6 +127,43 @@ class Fundamental(Base):
 
 
 # ── User features ─────────────────────────────────────────────────────────────
+
+class Transaction(Base):
+    """User trade history — the DB-backed replacement for transactions.csv.
+
+    ``transactions.csv`` holds personal trades and is deliberately
+    git-ignored (the repo is public), so it never reaches the deployed
+    container — which left the Portfolio tab permanently empty in
+    production. Persisting trades in Postgres (same pattern as
+    :class:`Watchlist` / :class:`Alert`) makes the Portfolio tab work
+    in production and survives redeploys.
+
+    On first boot an empty table is auto-seeded from the
+    ``TRANSACTIONS_CSV`` environment variable (or, during local
+    development, from a ``transactions.csv`` file). See
+    :mod:`ingestion.transactions`.
+
+    Column names mirror the CSV header so the loader maps cleanly back
+    to the legacy DataFrame schema
+    ``[user, ticker, date, quantity, price, currency, type]`` that the
+    rest of :mod:`analytics.portfolio` expects. ``user_name`` /
+    ``tx_type`` follow the existing table conventions (``type`` is also
+    a SQL-adjacent word best avoided as a column name).
+    """
+    __tablename__ = "transactions"
+    id         = Column(Integer,    primary_key=True, autoincrement=True)
+    user_name  = Column(String(100), nullable=False, index=True)
+    ticker     = Column(String(20),  nullable=False)
+    date       = Column(Date,        nullable=False)
+    quantity   = Column(Float,       nullable=False)
+    price      = Column(Float,       nullable=False)
+    currency   = Column(String(10),  nullable=False, default="EUR")
+    tx_type    = Column(String(10),  nullable=False)   # "buy" | "sell"
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        Index("ix_transactions_user", "user_name"),
+    )
+
 
 class Watchlist(Base):
     __tablename__ = "watchlist"

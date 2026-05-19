@@ -54,17 +54,40 @@ _TX_COLUMNS = ["user", "ticker", "date", "quantity", "price", "currency", "type"
 def load_transactions(path: str) -> pd.DataFrame:
     """Load the user's trade history.
 
-    ``transactions.csv`` holds personal trades and is deliberately
-    git-ignored (the repo is public), so it is absent on fresh clones
-    and on the deployed container. Treat a missing file as "no
-    portfolio yet" — the Screener, Watchlist, and Alerts tabs are
-    fully usable without it, and the Portfolio tab renders an empty
-    state instead of crashing the whole app.
+    Trades live in the ``transactions`` Postgres table (see
+    :mod:`ingestion.transactions`). ``transactions.csv`` holds personal
+    trades and is deliberately git-ignored (the repo is public), so it
+    is absent on the deployed container — which is exactly why a
+    DB-backed store is needed: the file-only approach left the
+    Portfolio tab permanently empty in production.
+
+    Flow:
+
+    1. Read from the DB. On first boot the table is auto-seeded from
+       the ``TRANSACTIONS_CSV`` env var (or a local ``transactions.csv``
+       in development).
+    2. If the database is unreachable, fall back to reading the local
+       CSV directly so local development still works without Postgres.
+    3. If neither yields data, return an empty frame — the Screener,
+       Watchlist, and Alerts tabs stay fully usable and the Portfolio
+       tab renders an empty state instead of crashing.
+
+    ``path`` is the CSV used both as the dev seed source and as the
+    offline fallback; it keeps the historical call signature intact.
     """
+    try:
+        from ingestion.transactions import ensure_seeded_and_load
+        return ensure_seeded_and_load(path)
+    except Exception:  # pragma: no cover - DB outage / driver issues
+        logger.exception(
+            "DB transactions unavailable — falling back to the local "
+            "CSV (%s) if present", path,
+        )
+
     if not os.path.exists(path):
         logger.warning(
-            "%s not found — running with an empty portfolio "
-            "(Screener / Watchlist / Alerts unaffected)", path,
+            "%s not found and DB unavailable — running with an empty "
+            "portfolio (Screener / Watchlist / Alerts unaffected)", path,
         )
         return pd.DataFrame(columns=_TX_COLUMNS)
 

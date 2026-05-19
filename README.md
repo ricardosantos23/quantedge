@@ -234,6 +234,14 @@ QuantEdge ships with a `Procfile` that works out of the box on Railway, Render, 
    - `DEBUG=False`
    - `LOG_LEVEL=INFO`
 5. Run `python setup.py` once via the platform's shell to bootstrap the database.
+6. Seed your personal trades. `transactions.csv` is git-ignored (the repo
+   is public) and never reaches the container, so the Portfolio tab is
+   empty until the `transactions` table is populated. Set the
+   `TRANSACTIONS_CSV` environment variable to the raw (or base64-encoded)
+   CSV contents — on first boot an empty table is auto-seeded from it.
+   After the first seed the data lives in the database; update it later
+   with `python -m ingestion.transactions sync --from-env` (or
+   `sync transactions.csv` from a shell with the file).
 
 ### Reliable nightly ingestion in production
 
@@ -274,6 +282,14 @@ FMP API
 
 **The app shows no data on first run**
 Run `python setup.py` first. The database must be populated before any tab will render meaningful data.
+
+**The Portfolio tab is empty in production (Railway/Render/Heroku)**
+`transactions.csv` is git-ignored because the repo is public, so it is
+not in the deployed container. Trades are stored in the `transactions`
+table instead. Set the `TRANSACTIONS_CSV` environment variable (raw or
+base64-encoded CSV); an empty table is auto-seeded from it on first
+boot. Verify with `python -m ingestion.transactions show`. Locally,
+a `transactions.csv` in the project root seeds the table automatically.
 
 **`psycopg2.OperationalError: could not connect to server`**
 Check `DATABASE_URL` in your `.env` and confirm PostgreSQL is running locally:
@@ -320,6 +336,7 @@ All settings live in `.env` (locally) or in the platform's environment-variable 
 | `DATABASE_URL` | `postgresql://quantedge:quantedge@localhost:5432/quantedge` | PostgreSQL connection string |
 | `YEARS_BACK` | `10` | Price history depth ingested by `setup.py` |
 | `SCREENER_UNIVERSE` | `500` | `"all"`, an integer (top-N by market cap), or a comma-separated ticker list |
+| `TRANSACTIONS_CSV` | _empty_ | One-time seed for the `transactions` table when empty. Raw CSV text or base64-encoded CSV (auto-detected). Only needed in production, where `transactions.csv` is git-ignored |
 | `NIGHTLY_CRON_HOUR` | `22` | Hour (UTC) for the embedded nightly job |
 | `NIGHTLY_CRON_MINUTE` | `0` | Minute (UTC) for the embedded nightly job |
 | `SMTP_HOST` | `smtp.gmail.com` | SMTP server for email alerts |
